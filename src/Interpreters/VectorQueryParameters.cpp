@@ -349,7 +349,7 @@ bool parseNumberLiteralFast(std::string_view literal, Field & result)
 
         ReadBufferFromMemory buf(float_str.data(), float_str.size());
         Float64 float_value;
-        if (tryReadFloatTextFast(float_value, buf) && buf.eof())
+        if (tryReadFloatTextPrecise(float_value, buf) && buf.eof())
         {
             result = float_value;
             return true;

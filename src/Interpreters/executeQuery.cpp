@@ -1499,10 +1499,12 @@ static std::optional<BlockIO> tryExecuteFromCache(
         pipeline.setProcessListElement(context->getProcessListElement());
     }
 
+    const bool log_as_internal = context->getClientInfo().is_internal;
+
     QueryResultCacheUsage query_result_cache_usage = output.query_result_cache_usage;
     QueryLogElement elem = logQueryStart(
         query_start_time, context, query_for_logging, normalized_query_hash, ast, pipeline,
-        nullptr, internal, String{}, String{}, false);
+        nullptr, internal, log_as_internal, String{}, String{}, false);
 
     auto finish_callback_finalize_pipeline = [
         query_result_cache_usage,
@@ -1512,12 +1514,12 @@ static std::optional<BlockIO> tryExecuteFromCache(
         return finalizeQueryPipelineBeforeLogging(std::move(query_pipeline), query_result_cache_usage, pulling_pipeline);
     };
     auto finish_callback = [elem, context, ast, implicit_tcl_executor, 
-                                query_result_cache_usage, internal,
+                                query_result_cache_usage, internal, log_as_internal, 
                                 pulling_pipeline = pipeline.pulling(),
                                 logger, query_span](const QueryPipelineFinalizedInfo & query_pipeline_finalized_info, std::chrono::system_clock::time_point finish_time) mutable
     {
         
-        logQueryFinishImpl(elem, context, ast, query_pipeline_finalized_info, pulling_pipeline, query_span, query_result_cache_usage, internal, finish_time);
+        logQueryFinishImpl(elem, context, ast, query_pipeline_finalized_info, pulling_pipeline, query_span, query_result_cache_usage, internal, log_as_internal, finish_time);
         if (implicit_tcl_executor->transactionRunning())
         {
             implicit_tcl_executor->commit(context);
@@ -1525,11 +1527,11 @@ static std::optional<BlockIO> tryExecuteFromCache(
     };
 
     auto exception_callback =
-        [start_watch, elem, context, ast, internal, query_span](bool log_error) mutable
+        [start_watch, elem, context, ast, internal, log_as_internal, query_span](bool log_error) mutable
     {
         if (auto txn = context->getCurrentTransaction())
             txn->onException();
-        logQueryException(elem, context, start_watch, ast, query_span, internal, log_error);
+        logQueryException(elem, context, start_watch, ast, query_span, internal, log_as_internal, log_error);
     };
     
     res.finalize_query_pipeline = std::move(finish_callback_finalize_pipeline);
@@ -1882,7 +1884,7 @@ static BlockIO executeQueryImpl(
             logQuery(query_for_logging, context, internal, stage);
 
             normalized_query_hash = normalizedQueryHash(query_for_logging, false);
-            logExceptionBeforeStart(query_for_logging, normalized_query_hash, context, out_ast, query_span, start_watch.elapsedMilliseconds(), internal);
+            logExceptionBeforeStart(query_for_logging, normalized_query_hash, context, out_ast, query_span, start_watch.elapsedMilliseconds(), internal, log_as_internal);
             throw;
         }
     }
