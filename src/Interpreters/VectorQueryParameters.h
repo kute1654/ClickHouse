@@ -89,9 +89,14 @@ public:
         /// shape preserved while vector literals have been normalized into explicit
         /// CAST(...) expressions.
         String new_sql;
+        std::vector<VectorQueryPlanCache::ASTLiteralPosition> ast_literal_position_list;
     };
 
     std::vector<VectorQueryPlanCache::ASTLiteralPosition> collectASTLiteralPositions(
+        const ASTPtr & query_ast,
+        bool only_vector = false) const;
+
+    VectorQueryParameters::NormalizedQueryResult normalizedAST(
         const ASTPtr & query_ast,
         bool only_vector = false) const;
 
@@ -142,7 +147,6 @@ public:
     /// locations, the function logs the mismatch and returns an empty binding list.
     std::vector<VectorQueryPlanCache::PlanConstantBinding> CollectQueryPlanConstants(
         QueryPlan & query_plan,
-        const std::vector<VectorQueryPlanCache::ASTLiteralPosition> & ast_literal_positions,
         const NormalizedQueryResult & parameters, bool only_vector = false);
 
 };

@@ -280,12 +280,12 @@ ASTPtr getASTNodeByPath(ASTPtr root, const std::vector<UInt32> & path)
     return current;
 }
 
-std::string_view stripOuterQuotes(std::string_view value)
-{
-    if (value.size() >= 2 && ((value.front() == '\'' && value.back() == '\'') || (value.front() == '"' && value.back() == '"')))
-        return value.substr(1, value.size() - 2);
-    return value;
-}
+// std::string_view stripOuterQuotes(std::string_view value)
+// {
+//     if (value.size() >= 2 && ((value.front() == '\'' && value.back() == '\'') || (value.front() == '"' && value.back() == '"')))
+//         return value.substr(1, value.size() - 2);
+//     return value;
+// }
 
 
 /// Parse a SQL string literal into a Field using SQL-style quoting rules.
@@ -600,14 +600,14 @@ bool candidateMatchesAstLiteral(
                 return false;
             }
             
-            bool match = parameters.params[ast_index].original_string == candidate.value.safeGet<String>();
-            return match;
+            // bool match = parameters.params[ast_index].original_string == candidate.value.safeGet<String>();
+            return false;
         }
 
-        if (candidate.value.getType() == Field::Types::String)
-        {
-            return stripOuterQuotes(parameters.params[ast_index].original_string) == candidate.value.safeGet<String>();
-        }
+        // if (candidate.value.getType() == Field::Types::String)
+        // {
+        //     return stripOuterQuotes(parameters.params[ast_index].original_string) == candidate.value.safeGet<String>();
+        // }
         if (candidate.value.getType() == Field::Types::Tuple)
         {
             LOG_DEBUG(logger, "not support tuple type");
@@ -758,7 +758,7 @@ void findActionsDAGAndCollectConstants(
             if (should_clear_and_return)
                 out_candidates.clear();
         }
-    }
+    }       
 
     std::unordered_map<UInt32, std::vector<size_t>> node_index_to_candidate_indices;
     for (size_t i = 0; i < out_candidates.size(); ++i)
@@ -928,7 +928,7 @@ bool parseNormalizedParams(
         }
         else if (!only_vector)
             parsed = parseNumberLiteralFast(raw, converted);
-            
+
         if (!parsed)
             converted = raw;
 
@@ -1007,7 +1007,7 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
         {
             result.new_sql += std::string(token.begin, token.size());
             continue;
-        }
+        } 
         if (token.isEnd() || token.isError())
             break;
         if (token.type == TokenType::BareWord && !tokenCanCache(token))
@@ -1322,7 +1322,7 @@ bool VectorQueryParameters::replaceConstantsInQueryPlan(
     NormalizedQueryResult & parameters,
     const std::vector<VectorQueryPlanCache::PlanConstantBinding> & plan_constant_bindings)
 {
-    if (plan_constant_bindings.empty() || parameters.params.empty() || parameters.parsed_params.empty())
+    if (plan_constant_bindings.empty() || parameters.parsed_params.empty())
         return false;
     auto * root = plan.getRootNode();
     if (!root)
@@ -1356,7 +1356,7 @@ bool VectorQueryParameters::replaceConstantsInQueryPlan(
         {
             Field raw_value = parameters.parsed_params[parameter_index];
             if (raw_value.getType() == Field::Types::String && isArray(dag_node.result_type))
-            {             
+            {
                 Field converted;
                 const auto & raw_text = raw_value.safeGet<String>();
                 if (stringToNumericArrayField(raw_text, dag_node.result_type, converted))
@@ -1734,6 +1734,346 @@ std::vector<VectorQueryPlanCache::ASTLiteralPosition> VectorQueryParameters::col
     return positions;
 }
 
+VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizedAST(
+    const ASTPtr & query_ast,
+    bool only_vector) const
+{
+    NormalizedQueryResult query_result;
+    
+    if (!query_ast)
+        return query_result;
+    
+    Field converted;
+    std::string_view raw = "'__VEC_PLACEHOLDER__'";
+    try
+    {
+        parseStringLiteral(raw, converted);
+    }
+    catch (...)
+    {
+        LOG_DEBUG(logger, "parse string error,raw={},size={},error={}", raw, raw.size(), getCurrentExceptionMessage(false));
+        return query_result;
+    }
+
+    std::vector<VectorQueryPlanCache::ASTLiteralPosition> positions;
+    std::unordered_set<std::string> unique_strings;
+
+    auto should_skip_limit_child = [](const ASTPtr & parent, const ASTPtr & child)
+    {
+        const auto * select = parent ? parent->as<ASTSelectQuery>() : nullptr;
+        if (!select || !child)
+            return false;
+
+        // LIMIT / OFFSET are restored through plan-step bindings instead of the
+        // generic AST literal-position list. Excluding them here keeps the main
+        // positional literal order focused on semantic constants used by filters,
+        // vector functions, and other expressions that survive plan reuse.
+        return child == select->limitLength()
+            || child == select->limitOffset()
+            || child == select->limitByLength()
+            || child == select->limitByOffset();
+    };
+
+    bool can_cache = true;
+
+    auto get_node_name = [&](const ASTPtr & child) -> String
+    {
+        if (!child)
+            return "null";
+        if (child->as<ASTLiteral>())
+            return "";
+        // Fallback to generic getID() which returns type name
+        return child->getID('-');
+    };
+
+    bool is_vector = true;
+
+    std::function<void(ASTPtr &, std::vector<ASTPtr> &, size_t, NodePath &, std::vector<String> &, String)> collect
+        = [&](ASTPtr & ast, std::vector<ASTPtr> & parent_list, size_t depth, NodePath & path,
+        std::vector<String> & function_list, String ast_path_name)
+    {
+        if (!ast || !can_cache)
+            return;
+        parent_list.push_back(ast);
+        size_t function_size = function_list.size();
+        String last_function_name = "";
+        bool is_cast = false;
+        if (function_size >= 1)
+            last_function_name = function_list[function_size - 1];
+        String last_second_function_name = "";
+        if (function_size >= 2)
+            last_second_function_name = function_list[function_size - 2];
+        if (auto * literal_node = ast->as<ASTLiteral>())
+        {
+            if (!functionCanCache(last_function_name))
+            {
+                can_cache = false;
+                return;
+            }
+            if (last_function_name == "modulo")
+            {
+                LOG_DEBUG(logger, "do not support {} Function", last_function_name);
+                can_cache = false;
+                return;
+            }
+            const auto type = literal_node->value.getType();
+            const auto target_type = applyVisitor(FieldToDataType(), literal_node->value);
+            std::vector<String> ident_name_list;
+            VectorQueryPlanCache::ASTLiteralPosition pos;
+            pos.identifier_name = "";
+            pos.field_type = static_cast<Int32>(type);
+            int literal_number = 0;
+            
+            size_t parent_size = parent_list.size();
+            int parent_index = static_cast<int>(parent_size) - 2;
+            if (last_function_name == getFunctionName(FunctionNames::CAST) &&
+                    (last_second_function_name == getFunctionName(FunctionNames::L2DISTANCE)
+                    || last_second_function_name == getFunctionName(FunctionNames::COSINEDISTANCE))
+                )
+            {
+                is_cast = true;
+                parent_index = parent_index - 2;
+            }
+            if (parent_index < 0 || static_cast<size_t>(parent_index) >= parent_list.size())
+            {
+                LOG_DEBUG(logger, "Prevent out-of-bounds access");
+                parent_list.pop_back();
+                return; // Prevent out-of-bounds access
+            }
+            auto parent = parent_list[parent_index];
+            for (size_t i = 0; i < parent->children.size(); ++i)
+            {
+                if (parent->children[i]->as<ASTLiteral>())
+                    literal_number++;
+                if (const auto * ident_node = parent->children[i]->as<ASTIdentifier>())
+                    ident_name_list.push_back(ident_node->name());
+            }
+            parent_list.pop_back();
+            if (last_function_name == getFunctionName(FunctionNames::L2DISTANCE) || last_function_name == getFunctionName(FunctionNames::COSINEDISTANCE))
+            {
+                if (static_cast<Int32>(type) != FieldRef::Types::Array)
+                {
+                    can_cache = false;
+                    LOG_DEBUG(logger, "1, last_function_name = {} type = {}",
+                        last_function_name, static_cast<Int32>(type));
+                    return;
+                }
+            }
+            else if (last_function_name == getFunctionName(FunctionNames::HASTOKEN))
+            {
+                if (static_cast<Int32>(type) != FieldRef::Types::String)
+                {
+                    can_cache = false;
+                    LOG_DEBUG(logger, "2, last_function_name = {} type = {}",
+                        last_function_name, static_cast<Int32>(type));
+                    return;
+                }
+            }
+            else if (last_function_name == getFunctionName(FunctionNames::CAST))
+            {
+                if (last_second_function_name == getFunctionName(FunctionNames::L2DISTANCE) || last_second_function_name == getFunctionName(FunctionNames::COSINEDISTANCE))
+                {
+                    pos.field_type = FieldRef::Types::Array;
+                    if (is_vector)
+                    {
+                        is_vector = false;
+                        if (static_cast<Int32>(type) != FieldRef::Types::String)
+                        {
+                            can_cache = false;
+                            LOG_DEBUG(logger, "3, last_function_name = {} type = {}",
+                                last_function_name, static_cast<Int32>(type));
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        is_vector = true;
+                        return;
+                    }    
+                }
+                else
+                {
+                    can_cache = false;
+                    LOG_DEBUG(logger, "4, last_function_name = {} type = {}",
+                            last_function_name, static_cast<Int32>(type));
+                    return;
+                }
+            }
+            else if (!only_vector)
+            {
+                if (literal_number == 1 && (last_function_name == "and" || last_function_name == "or"))
+                {
+                    LOG_DEBUG(logger, "found {} constant ", last_function_name);
+                    can_cache = false;
+                    return;
+                }
+                if (literal_number >= 2 && (last_function_name == "equals" || last_function_name == "notEquals" ||
+                    last_function_name == "less" || last_function_name == "greater" ||
+                    last_function_name == "lessOrEquals" || last_function_name == "greaterOrEquals" ||
+                    last_function_name == "like" || last_function_name == "notLike" ||
+                    last_function_name == "in" || last_function_name == "notIn"))
+                {
+                    LOG_DEBUG(logger, "last_function_name={} found constant op constant", last_function_name);
+                    can_cache = false;
+                    return;
+                }
+                if (!ident_name_list.empty())
+                {
+                    ast_path_name += "Identifier-" + ident_name_list[0];
+                    pos.identifier_name = ident_name_list[0];
+                }
+                else
+                {
+                    ast_path_name += "parameter-" + toString(path[path.size() - 1]);
+                    pos.identifier_name = " ";
+                }
+            }
+            if (ident_name_list.size() >= 1  &&
+                    (last_function_name == getFunctionName(FunctionNames::L2DISTANCE) || last_function_name == getFunctionName(FunctionNames::HASTOKEN) || last_function_name == getFunctionName(FunctionNames::COSINEDISTANCE) ||
+                        (is_cast && last_second_function_name == getFunctionName(FunctionNames::L2DISTANCE)) ||
+                        (is_cast && last_second_function_name == getFunctionName(FunctionNames::COSINEDISTANCE))
+                    )
+                )
+            {
+                ast_path_name += "Identifier-" + ident_name_list[0];
+                pos.identifier_name = ident_name_list[0];
+            }
+            if (!pos.identifier_name.empty())
+            {
+                ast_path_name += "_Literal-" + dataTypePtrToString(target_type) + "-" + applyVisitor(FieldVisitorToString(), literal_node->value);
+                if (unique_strings.contains(ast_path_name))
+                {
+                    LOG_DEBUG(logger, "ast_path_name={} is exist", ast_path_name);
+                    can_cache = false;
+                    return;
+                }
+                unique_strings.insert(ast_path_name);
+                pos.step_type = -1;
+                // Determine step type from ast_path_name in a more robust way
+                if (ast_path_name.length() > static_cast<size_t>(Offset::StepType)) 
+                {
+                    char step_char = ast_path_name[static_cast<size_t>(Offset::StepType)];
+                    if (step_char == 'E')
+                    {
+                        if (last_function_name == getFunctionName(FunctionNames::L2DISTANCE) || last_function_name == getFunctionName(FunctionNames::HASTOKEN) || last_function_name == getFunctionName(FunctionNames::COSINEDISTANCE) ||
+                            (is_cast && last_second_function_name == getFunctionName(FunctionNames::L2DISTANCE)) ||
+                            (is_cast && last_second_function_name == getFunctionName(FunctionNames::COSINEDISTANCE))
+                        )
+                            pos.step_type = 4;
+                        else
+                            pos.step_type = 1;
+                    }
+                    if (step_char == 'F')
+                        pos.step_type = 2;
+                    if (step_char == 'T')
+                        pos.step_type = 3;
+                }
+
+                if (pos.step_type == 3)
+                {
+                    LOG_DEBUG(logger, "Join ... On found Literal");
+                    can_cache = false;
+                    return;
+                }
+                pos.path = path;
+                pos.target_type = target_type;
+                pos.function_list = function_list;
+                pos.ast_path_name = ast_path_name;
+                pos.identifier_name = getFieldName(pos.identifier_name);
+                positions.push_back(pos);
+                query_result.parsed_params.push_back(literal_node->value);
+                literal_node->value = converted;
+            }
+            return;
+        }
+        if (const auto * func = ast->as<ASTFunction>())
+        {
+            // Preserve a stable traversal order for function nodes:
+            // parameters first, then regular arguments, then any remaining children.
+            // The same order must be used everywhere that maps parameter index ->
+            // AST literal position -> QueryPlan binding.
+            String function_name = Poco::toLower(func->name);
+            
+            if (!only_vector || 
+                    (only_vector && 
+                        (function_name == getFunctionName(FunctionNames::COSINEDISTANCE) || function_name == getFunctionName(FunctionNames::L2DISTANCE) || function_name == getFunctionName(FunctionNames::HASTOKEN) ||
+                            (function_name == getFunctionName(FunctionNames::CAST) && 
+                                (last_function_name == getFunctionName(FunctionNames::COSINEDISTANCE) || last_function_name == getFunctionName(FunctionNames::L2DISTANCE) || last_function_name == getFunctionName(FunctionNames::HASTOKEN))
+                            )
+                        )
+                    )
+                )
+            {
+                function_list.push_back(function_name);
+                if (function_name != getFunctionName(FunctionNames::COSINEDISTANCE) && function_name != getFunctionName(FunctionNames::L2DISTANCE))
+                {
+                    for (size_t i = 0; i < ast->children.size(); ++i)
+                    {
+                        auto & child = ast->children[i];
+                        if (child == func->parameters)
+                        {
+                            path.push_back(static_cast<UInt32>(i));
+                            collect(child, parent_list, depth + 1, path, function_list, ast_path_name + "_" + get_node_name(child));
+                            path.pop_back();
+                        }
+                    }
+                }
+                for (size_t i = 0; i < ast->children.size(); ++i)
+                {
+                    auto & child = ast->children[i];
+                    if (child == func->arguments)
+                    {
+                        path.push_back(static_cast<UInt32>(i));
+                        collect(child, parent_list, depth + 1, path, function_list, ast_path_name + "_" + get_node_name(child));
+                        path.pop_back();
+                    }
+                }
+                for (size_t i = 0; i < ast->children.size(); ++i)
+                {
+                    auto & child = ast->children[i];
+                    if (child == func->parameters || child == func->arguments)
+                        continue;
+                    if (should_skip_limit_child(ast, child))
+                        continue;
+                    path.push_back(static_cast<UInt32>(i));
+                    collect(child, parent_list, depth + 1, path, function_list, ast_path_name + "_" + get_node_name(child));
+                    path.pop_back();
+                }
+                function_list.pop_back();
+                parent_list.pop_back();
+                return;
+            }
+            parent_list.pop_back();
+            return;
+        }
+
+        for (size_t i = 0; i < ast->children.size(); ++i)
+        {
+            auto & child = ast->children[i];
+            if (should_skip_limit_child(ast, child))
+                continue;
+            path.push_back(static_cast<UInt32>(i));
+            collect(child, parent_list, depth + 1, path, function_list, ast_path_name + "_" + get_node_name(child));
+            path.pop_back();
+        }
+        parent_list.pop_back();
+    };
+
+    NodePath root_path;
+    std::vector<ASTPtr> parent_list;
+    std::vector<String> function_list;
+    ASTPtr ast_clone = query_ast->clone();
+    collect(ast_clone, parent_list, 0, root_path, function_list, "");
+    if (!can_cache)
+    {
+        query_result.parsed_params.clear();
+        return query_result;
+    }
+    query_result.normalized_sql = ast_clone->formatForLogging();
+    query_result.ast_literal_position_list = std::move(positions);
+    return query_result;
+}
+
 std::vector<Field> VectorQueryParameters::buildParameterValuesFromAST(
     const ASTPtr & query_ast,
     const std::vector<VectorQueryPlanCache::ASTLiteralPosition> & positions)
@@ -1840,7 +2180,7 @@ String VectorQueryParameters::rewriteVectorLiteralsToCasts(
         {
             new_sql += std::string(token.begin, token.size());
             break;
-        }    
+        }
         if (vector_function_type && token.type == TokenType::BareWord)
             is_bare_word = true;
         if (token.type == TokenType::BareWord && !vector_function_type
@@ -1912,7 +2252,7 @@ String VectorQueryParameters::rewriteVectorLiteralsToCasts(
             {
                 String original_array(array_begin, static_cast<size_t>(array_end - array_begin));
                 
-                new_sql += original_array;
+                new_sql += original_array;            
                 if (array_depth == 1 && !is_function)
                     new_sql += "','Array(Float)')";
                 continue;
@@ -1958,14 +2298,13 @@ bool VectorQueryParameters::parseNormalizedParamsWithPlan(
 
 std::vector<VectorQueryPlanCache::PlanConstantBinding> VectorQueryParameters::CollectQueryPlanConstants(
     QueryPlan & query_plan,
-    const std::vector<VectorQueryPlanCache::ASTLiteralPosition> & ast_literal_positions,
     const NormalizedQueryResult & parameters, bool only_vector)
 {
     std::vector<VectorQueryPlanCache::PlanConstantBinding> bindings;
     QueryPlan::Node * root = query_plan.getRootNode();
     if (!root)
         return bindings;
-    if (ast_literal_positions.empty())
+    if (parameters.ast_literal_position_list.empty())
         return bindings;
 
     std::vector<std::pair<QueryPlan::Node *, NodePath>> stack;
@@ -1973,7 +2312,7 @@ std::vector<VectorQueryPlanCache::PlanConstantBinding> VectorQueryParameters::Co
     std::unordered_set<QueryPlan::Node *> visited;
     visited.reserve(64);
     std::vector<PlanConstantCandidate> candidates;
-    candidates.reserve(ast_literal_positions.size());
+    candidates.reserve(parameters.ast_literal_position_list.size());
     while (!stack.empty())
     {
         auto [node, path] = stack.back();
@@ -2007,11 +2346,11 @@ std::vector<VectorQueryPlanCache::PlanConstantBinding> VectorQueryParameters::Co
     }
 
     std::vector<bool> candidate_used(candidates.size(), false);
-    bindings.reserve(ast_literal_positions.size());
+    bindings.reserve(parameters.ast_literal_position_list.size());
     
-    for (size_t ast_index = 0; ast_index < ast_literal_positions.size(); ++ast_index)
+    for (size_t ast_index = 0; ast_index < parameters.ast_literal_position_list.size(); ++ast_index)
     {
-        const auto & ast_position = ast_literal_positions[ast_index];
+        const auto & ast_position = parameters.ast_literal_position_list[ast_index];
         std::vector<size_t> matched_candidate_indexes;
 
         for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index)
@@ -2034,12 +2373,11 @@ std::vector<VectorQueryPlanCache::PlanConstantBinding> VectorQueryParameters::Co
 
             LOG_DEBUG(
                 logger,
-                "CollectQueryPlanConstants failed: no QueryPlan constant matches AST literal index={} step_type={} identifier_name={} ast_path_name={} raw_param={} parsed_param={} function_list={}",
+                "CollectQueryPlanConstants failed: no QueryPlan constant matches AST literal index={} step_type={} identifier_name={} ast_path_name={} parsed_param={} function_list={}",
                 ast_index,
                 ast_position.step_type,
                 ast_position.identifier_name,
                 ast_position.ast_path_name,
-                ast_index < parameters.params.size() ? parameters.params[ast_index].original_string : String{},
                 ast_index < parameters.parsed_params.size() ? applyVisitor(FieldVisitorToString(), parameters.parsed_params[ast_index]) : String{},
                 function_chain);
             bindings.clear();
