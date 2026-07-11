@@ -54,18 +54,22 @@ namespace
 auto logger = getLogger("VectorQueryParameters");
 using NodePath = std::vector<UInt32>;
 
+/// Canonical lowercase names for the recognized vector/search functions.
 constexpr std::string_view COSINEDISTANCE_FUNCTION_NAME = "cosinedistance";
 constexpr std::string_view L2DISTANCE_FUNCTION_NAME = "l2distance";
 constexpr std::string_view HASTOKEN_FUNCTION_NAME = "hastoken";
 constexpr std::string_view CAST_FUNCTION_NAME = "cast";
 
+/// Convert a DataTypePtr to its string representation for logging/debugging.
 String dataTypePtrToString(const DataTypePtr & type)
 {
     if (!type)
         return "nullptr";
     return type->getName();
 }
-// check whether a bareword preceding the '-' symbol does not affect the judgment of negative signs
+
+/// Check whether a bareword preceding the '-' symbol is a SQL keyword.
+/// If it is, the '-' should be treated as a minus operator rather than part of a negative number literal.
 bool tokenIsKeyWord(const String & token_name)
 {
     String name = Poco::toLower(token_name);
@@ -90,7 +94,9 @@ bool tokenIsKeyWord(const String & token_name)
     };
     return keywords.contains(name);
 }
-// check whether the token preceding the '-' symbol does not affect the judgment of negative signs
+/// Check whether the token preceding a '-' is a value (not a keyword/operator/comma).
+/// When the preceding token is a value, the '-' is an arithmetic operator (e.g. "a - 1"),
+/// not the start of a negative number literal (e.g. "WHERE x = -1").
 bool tokenIsValue(Token token)
 {        
     if (token.type == TokenType::Comma || token.type == TokenType::OpeningRoundBracket || token.type == TokenType::OpeningSquareBracket ||
@@ -102,6 +108,10 @@ bool tokenIsValue(Token token)
     return true;            
 }
 
+/// Determine whether a function's arguments can be safely normalized (replaced with '?')
+/// for caching purposes.  Functions that are non-deterministic, timezone-sensitive, or
+/// whose string arguments are structural (type names, format patterns) would cause
+/// incorrect cache key collisions if normalized, so they are excluded.
 bool functionCanCache(const String & function_name)
 {
     String fun_name = Poco::toLower(function_name);
@@ -199,6 +209,8 @@ bool functionCanCache(const String & function_name)
     return true;
 }
 
+/// Check whether a lexer token (if it looks like a function name) can be cached.
+/// Tokens shorter than 3 characters are never function names, so they pass.
 bool tokenCanCache(Token token)
 {
     if (token.size() >= 3)
@@ -206,6 +218,10 @@ bool tokenCanCache(Token token)
     return true;
 }
 
+/// Check whether a function name should be processed by the parameterizer.
+/// When `only_vector` is true, only vector search functions (cosinedistance,
+/// l2distance, hastoken) are recognized.  Otherwise, the general functionCanCache
+/// check is used.
 bool checkFunctionName(const String function_name, bool only_vector)
 {
     if (only_vector)
@@ -219,6 +235,8 @@ bool checkFunctionName(const String function_name, bool only_vector)
     return functionCanCache(function_name);
 }
 
+/// Assign a numeric rank to each numeric TypeIndex for type promotion decisions.
+/// Higher rank means wider type; used by getType() to pick the wider of two numeric types.
 static constexpr int getTypeRank(TypeIndex idx)
 {
     switch (idx)
@@ -242,32 +260,39 @@ static constexpr int getTypeRank(TypeIndex idx)
     }
 }
 
+/// Pick the wider of two numeric types for constant replacement.
+/// When the runtime parameter type is wider than the plan's stored type (e.g. Int64 vs Int32),
+/// the wider type is used to avoid truncation.  Array types always use the result_type.
 DataTypePtr getType(DataTypePtr data_type_ptr, DataTypePtr result_type)
 {
     if (isArray(result_type) || !data_type_ptr)
         return result_type;
-    
+
     WhichDataType which_data(data_type_ptr);
     WhichDataType which_result(result_type);
     bool data_is_numeric = which_data.isInteger() || which_data.isFloat();
     bool result_is_numeric = which_result.isInteger() || which_result.isFloat();
- 
+
     if (!data_is_numeric || !result_is_numeric)
         return result_type;
- 
+
     int data_rank = getTypeRank(data_type_ptr->getColumnType());
     int result_rank = getTypeRank(result_type->getColumnType());
- 
+
     if (data_rank > result_rank)
         return data_type_ptr;
     return result_type;
 }
 
+/// Check whether a DAG scope string indicates a VectorScan step.
+/// VectorScan bindings use special matching rules for array-typed constants.
 bool isVectorScanBindingScope(const String & dag_scope)
 {
     return dag_scope.find("VectorScan") != String::npos;
 }
 
+/// Navigate an AST tree by following a sequence of child indices.
+/// Returns the node at the given path, or nullptr if any index is out of bounds.
 ASTPtr getASTNodeByPath(ASTPtr root, const std::vector<UInt32> & path)
 {
     ASTPtr current = std::move(root);
@@ -288,7 +313,8 @@ ASTPtr getASTNodeByPath(ASTPtr root, const std::vector<UInt32> & path)
 // }
 
 
-/// Parse a SQL string literal into a Field using SQL-style quoting rules.
+/// Parse a SQL single-quoted string literal (e.g. 'hello world') into a Field.
+/// Uses ClickHouse's SQL-style quoting rules (backslash escapes, doubled quotes).
 bool parseStringLiteral(std::string_view literal, Field & result)
 {
     ReadBufferFromMemory buf(literal.data(), literal.size());
@@ -300,6 +326,9 @@ bool parseStringLiteral(std::string_view literal, Field & result)
     return true;
 }
 
+/// Fast path for parsing numeric literals (integers and floats) from raw token text.
+/// Handles optional sign prefixes, underscore separators, decimal points, and exponents.
+/// Returns true and sets `result` on success; returns false on malformed input.
 bool parseNumberLiteralFast(std::string_view literal, Field & result)
 {
     if (literal.empty())
@@ -386,6 +415,9 @@ bool parseNumberLiteralFast(std::string_view literal, Field & result)
     }
 }
 
+/// Parse a string representation of a numeric array (e.g. "[1.0, 2.0, 3.0]") into a typed Array Field.
+/// Uses the target DataTypeArray's serialization to deserialize the text directly.
+/// Returns false on parse failure or if the target type is not an array type.
 bool stringToNumericArrayField(std::string_view literal, const DataTypePtr & target_type, Field & result)
 {
     if (!target_type)
@@ -434,6 +466,7 @@ bool stringToNumericArrayField(std::string_view literal, const DataTypePtr & tar
 }
 
 
+/// Check if a Field type is one of the three numeric types (UInt64, Int64, Float64).
 bool isNumericFieldType(Field::Types::Which type)
 {
     return type == Field::Types::UInt64
@@ -441,6 +474,8 @@ bool isNumericFieldType(Field::Types::Which type)
         || type == Field::Types::Float64;
 }
 
+/// Convert any numeric Field value to Float64 for cross-type comparison.
+/// Returns 0.0 for non-numeric types.
 Float64 toFloat64(const Field & field)
 {
     switch (field.getType())
@@ -456,6 +491,9 @@ Float64 toFloat64(const Field & field)
     }
 }
 
+/// Compare two Fields for value equality, handling cross-type numeric comparison.
+/// Array fields are compared element-wise recursively.  When types differ but both
+/// are numeric, the values are promoted to Float64 before comparison.
 bool fieldsEquivalent(const Field & lhs, const Field & rhs)
 {
     const auto lhs_type = lhs.getType();
@@ -484,6 +522,7 @@ bool fieldsEquivalent(const Field & lhs, const Field & rhs)
     return false;
 }
 
+/// Map a FunctionNames enum value to its canonical lowercase string_view.
 std::string_view getFunctionName(FunctionNames fn_enum)
 {
     switch (fn_enum)
@@ -500,12 +539,15 @@ std::string_view getFunctionName(FunctionNames fn_enum)
     __builtin_unreachable();
 }
 
+/// Append the canonical function name string to the output buffer.
 void appendFunctionName(String & out, FunctionNames fn_enum)
 {
     const auto name = getFunctionName(fn_enum);
     out.append(name.data(), name.size());
 }
 
+/// Extract the field name portion after the last '.' in a qualified name.
+/// For example, "table.column" returns "column".  Returns empty string on failure.
 String getFieldName(String input_name)
 {
     if (input_name.empty())
@@ -517,6 +559,7 @@ String getFieldName(String input_name)
 }
 
 
+/// Get the innermost (last) function name from an AST literal position's function chain.
 String getLastFunctionName(const VectorQueryPlanCache::ASTLiteralPosition & position)
 {
     if (position.function_list.empty())
@@ -524,6 +567,8 @@ String getLastFunctionName(const VectorQueryPlanCache::ASTLiteralPosition & posi
     return Poco::toLower(position.function_list.back());
 }
 
+/// Get the second-to-last function name from an AST literal position's function chain.
+/// Used to detect patterns like cosinedistance(CAST(...)) where the inner function is CAST.
 String getSecondLastFunctionName(const VectorQueryPlanCache::ASTLiteralPosition & position)
 {
     if (position.function_list.size() < 2)
@@ -531,6 +576,8 @@ String getSecondLastFunctionName(const VectorQueryPlanCache::ASTLiteralPosition 
     return Poco::toLower(position.function_list[position.function_list.size() - 2]);
 }
 
+/// Check whether a plan step's scope string matches the expected step type.
+/// step_type 1/4 → "ExpressionStep", step_type 2 → "FilterStep".
 bool scopeMatchesStepType(Int32 step_type, const String & scope)
 {
     switch (step_type)
@@ -545,6 +592,13 @@ bool scopeMatchesStepType(Int32 step_type, const String & scope)
     }
 }
 
+/// Determine whether a plan-side constant candidate matches an AST-side literal position.
+/// Matching criteria (all must pass):
+///   1. The plan step scope must match the AST step type (Expression/Filter).
+///   2. The identifier (column) name must match when the AST has one.
+///   3. The enclosing function chain must be compatible.
+///   4. The runtime parameter value must be equivalent to the candidate's current value.
+/// Returns true if the candidate is a valid match for the given AST literal.
 bool candidateMatchesAstLiteral(
     const PlanConstantCandidate & candidate,
     size_t ast_index,
@@ -554,10 +608,10 @@ bool candidateMatchesAstLiteral(
     if (!scopeMatchesStepType(position.step_type, candidate.binding.dag_scope))
         return false;
     if (!position.identifier_name.empty() && candidate.identifier_names != position.identifier_name)
-        return false;    
+        return false;
     const String ast_last_function = getLastFunctionName(position);
     const String ast_second_last_function = getSecondLastFunctionName(position);
-    
+
     if (!candidate.function_names.empty())
     {
         size_t number = candidate.function_names.size();
@@ -599,15 +653,8 @@ bool candidateMatchesAstLiteral(
                     return fieldsEquivalent(converted, candidate.value);
                 return false;
             }
-            
-            // bool match = parameters.params[ast_index].original_string == candidate.value.safeGet<String>();
             return false;
         }
-
-        // if (candidate.value.getType() == Field::Types::String)
-        // {
-        //     return stripOuterQuotes(parameters.params[ast_index].original_string) == candidate.value.safeGet<String>();
-        // }
         if (candidate.value.getType() == Field::Types::Tuple)
         {
             LOG_DEBUG(logger, "not support tuple type");
@@ -618,6 +665,12 @@ bool candidateMatchesAstLiteral(
     return false;
 }
 
+/// Walk an ActionsDAG from its output nodes and collect all COLUMN (constant) nodes
+/// that are children of recognized cacheable functions.  Each constant becomes a
+/// PlanConstantCandidate with its DAG node index, parent function chain, identifier name,
+/// and current value.  When `only_vector` is true, only constants inside vector search
+/// functions are collected.  Shared COLUMN nodes (used by multiple parent functions) are
+/// automatically split so each parent gets its own independent constant node.
 void findActionsDAGAndCollectConstants(
     ActionsDAG & dag,
     const std::vector<UInt32> & plan_node_path,
@@ -842,8 +895,9 @@ void findActionsDAGAndCollectConstants(
 
 namespace
 {
-/// Helper function to check if a lexer token starts with the SELECT keyword.
-/// Filters out non-significant tokens before checking.
+/// Check if the SQL text starts with the SELECT keyword.
+/// Skips non-significant tokens (comments, whitespace) before checking.
+/// Non-SELECT queries (INSERT, CREATE, etc.) are not eligible for vector plan caching.
 bool isSelectStatement(Lexer pre_lexer)
 {
     Token first = pre_lexer.nextToken();
@@ -864,8 +918,10 @@ bool isSelectStatement(Lexer pre_lexer)
         && equalsCaseInsensitive(word[5], 't');
 }
 
-/// Helper function to check if a token matches a bare word by name (case-insensitive).
+/// Check if a lexer token matches a given bare word name (case-insensitive).
 /// The token and bare_word_name must have the same length for an exact match.
+/// Used to recognize SQL keywords (SELECT, FROM, WHERE) and function names
+/// (l2distance, cosinedistance, hastoken, cast) during tokenization.
 bool tokenMatchesBareWord(Token token, std::string_view bare_word_name)
 {
     if (token.size() != bare_word_name.size())
@@ -880,6 +936,12 @@ bool tokenMatchesBareWord(Token token, std::string_view bare_word_name)
     return true;
 }
 
+/// Core parsing routine shared by the AST and QueryPlan paths.
+/// Iterates over `parameters.params`, converts each raw string token into a typed Field
+/// using the provided type hints (`target_types`, `literal_types`), and populates
+/// `parameters.parsed_params`.  String literals are parsed via parseStringLiteral(),
+/// numeric arrays via stringToNumericArrayField(), and plain numbers via parseNumberLiteralFast().
+/// Returns true if at least one parameter was successfully parsed.
 bool parseNormalizedParams(
     VectorQueryParameters::NormalizedQueryResult & parameters,
     const std::vector<DataTypePtr> & target_types,
@@ -941,19 +1003,29 @@ bool parseNormalizedParams(
 
 }
 
+/// Tokenize the raw SQL text and produce a normalized cache key plus extracted parameters.
+///
+/// This function does two jobs at once:
+/// 1. Build a cache-key-friendly SQL template where replaceable literals collapse to '?'.
+/// 2. Preserve the original literal text in `params` so cache hits can rebuild
+///    AST / QueryPlan snapshots with the current runtime values.
+///
+/// The lexer recognizes vector search function boundaries (l2distance, cosinedistance,
+/// hastoken) and handles special cases:
+///   - Vector array literals are kept as-is (not normalized) unless `use_cast` is set.
+///   - The LIMIT keyword stops parameter collection (LIMIT values are plan-step bindings).
+///   - POSITION(x IN y) parameters are reordered to match the canonical AST order.
+///   - DATE_PART's first string argument (field name) is skipped.
+///   - Negative number literals (preceded by '-') are collected as single tokens.
+///   - SYSTEM table queries are rejected (not cacheable).
+///
+/// Returns a NormalizedQueryResult with hash=0 if the query is not eligible for caching.
 VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQueryAndExtractParams(
     const char * begin,
     const char * end,
     bool only_vector,
     bool use_cast)
 {
-    // The normalized SQL text becomes the cache-key payload, while params preserves
-    // the original literal token stream in the exact order later expected by AST / plan restore.
-    //
-    // The function does two jobs at once:
-    // 1. Build a cache-key-friendly SQL template where literal runs collapse to '?'.
-    // 2. Preserve the original literal text in `params` so cache hits can rebuild
-    //    AST / QueryPlan snapshots with the current runtime values.
     NormalizedQueryResult result;
     SipHash hash;
     Lexer lexer(begin, end);
@@ -1317,6 +1389,20 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
 }
 
 
+/// Rewrite every constant slot in the cached QueryPlan with the current runtime values.
+///
+/// Each binding in `plan_constant_bindings` points to a specific COLUMN node inside an
+/// ActionsDAG (identified by plan_node_path + dag_node_index).  The method replaces that
+/// node's const column with a new ColumnConst holding the parsed runtime Field value.
+///
+/// The replacement process:
+///   1. Navigate to the plan node by its path from the root.
+///   2. Identify the step type (FilterStep or ExpressionStep).
+///   3. Locate the ActionsDAG node by index.
+///   4. Convert the runtime value to the appropriate type.
+///   5. Replace the COLUMN node's const column payload.
+///
+/// Returns false if any replacement fails (type mismatch, missing node, etc.).
 bool VectorQueryParameters::replaceConstantsInQueryPlan(
     QueryPlan & plan,
     NormalizedQueryResult & parameters,
@@ -1328,6 +1414,7 @@ bool VectorQueryParameters::replaceConstantsInQueryPlan(
     if (!root)
         return false;
 
+    /// Lambda to navigate the plan tree by a sequence of child indices.
     auto get_node_by_path = [&](const NodePath & path) -> QueryPlan::Node *
     {
         QueryPlan::Node * current = root;
@@ -1340,6 +1427,8 @@ bool VectorQueryParameters::replaceConstantsInQueryPlan(
         return current;
     };
 
+    /// Lambda to replace a single COLUMN node in an ActionsDAG with a new constant value.
+    /// Handles type promotion via getType() and array string-to-field conversion.
     auto apply_bindings_to_dag = [&](ActionsDAG & dag, const UInt32 dag_node_index, const UInt32 parameter_index, DataTypePtr data_type_ptr)
     {
         if (parameter_index >= parameters.parsed_params.size())
@@ -1413,6 +1502,20 @@ bool VectorQueryParameters::replaceConstantsInQueryPlan(
     return true;
 }
 
+/// Walk the AST and collect positions of all cacheable literal nodes.
+///
+/// Each collected position records:
+///   - The AST path (sequence of child indices from the root)
+///   - The enclosing function chain (e.g. ["cosinedistance", "cast"])
+///   - The identifier (column) name from the parent function's arguments
+///   - The step type (1=Expression, 2=Filter, 4=VectorExpression)
+///   - The literal's target data type
+///   - A unique path name for deduplication
+///
+/// LIMIT/OFFSET literals are excluded (they use plan-step bindings instead).
+/// The function returns an empty vector if any unsupported pattern is detected
+/// (tuple literals, modulo function, duplicate path names, etc.).
+/// When `only_vector` is true, only literals inside vector search functions are collected.
 std::vector<VectorQueryPlanCache::ASTLiteralPosition> VectorQueryParameters::collectASTLiteralPositions(
     const ASTPtr & query_ast,
     bool only_vector) const
@@ -1422,6 +1525,7 @@ std::vector<VectorQueryPlanCache::ASTLiteralPosition> VectorQueryParameters::col
         return positions;
     std::unordered_set<std::string> unique_strings;
 
+    /// Lambda to skip LIMIT/OFFSET children — they are handled by plan-step bindings.
     auto should_skip_limit_child = [](const ASTPtr & parent, const ASTPtr & child)
     {
         const auto * select = parent ? parent->as<ASTSelectQuery>() : nullptr;
@@ -1734,15 +1838,27 @@ std::vector<VectorQueryPlanCache::ASTLiteralPosition> VectorQueryParameters::col
     return positions;
 }
 
+/// Normalize an AST in-place by replacing each collectable literal with a placeholder.
+///
+/// This is the AST-based alternative to normalizeQueryAndExtractParams (which works on
+/// raw SQL text).  It clones the AST, walks it to find cacheable literals, replaces each
+/// with the sentinel string '__VEC_PLACEHOLDER__', and records the original values in
+/// `query_result.parsed_params`.
+///
+/// Returns a NormalizedQueryResult containing:
+///   - normalized_sql: the formatted AST after placeholder substitution
+///   - parsed_params: the original literal values in traversal order
+///   - ast_literal_position_list: the AST paths and metadata for each replaced literal
+/// Returns an empty result if the AST contains unsupported patterns.
 VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizedAST(
     const ASTPtr & query_ast,
     bool only_vector) const
 {
     NormalizedQueryResult query_result;
-    
+
     if (!query_ast)
         return query_result;
-    
+
     Field converted;
     std::string_view raw = "'__VEC_PLACEHOLDER__'";
     try
@@ -2074,6 +2190,9 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizedAS
     return query_result;
 }
 
+/// Extract literal values from an AST by following the recorded position paths.
+/// Used to build the parameter vector from a live AST (e.g. for cache key comparison).
+/// Returns an empty vector if any path does not resolve to an ASTLiteral node.
 std::vector<Field> VectorQueryParameters::buildParameterValuesFromAST(
     const ASTPtr & query_ast,
     const std::vector<VectorQueryPlanCache::ASTLiteralPosition> & positions)
@@ -2095,6 +2214,10 @@ std::vector<Field> VectorQueryParameters::buildParameterValuesFromAST(
     return values;
 }
 
+/// Re-inject parsed parameter values into a cached AST at the recorded literal positions.
+/// This restores a cached AST template with the current query's runtime values.
+/// The parameter index maps 1:1 to the AST literal position index (same traversal order).
+/// Returns true if at least one literal was successfully replaced.
 bool VectorQueryParameters::applyParametersByASTLiteralPositions(
     ASTPtr & query_ast,
     NormalizedQueryResult & parameters,
@@ -2130,6 +2253,11 @@ bool VectorQueryParameters::applyParametersByASTLiteralPositions(
     }
 }
 
+/// Parse raw parameter strings into typed Fields using type hints from AST literal positions.
+/// For each parameter, the corresponding AST position provides:
+///   - field_type: the Field::Types::Which value (String, UInt64, Array, etc.)
+///   - target_type: the DataTypePtr for type-specific parsing (e.g. Array(Float32))
+/// Delegates to the shared parseNormalizedParams() helper.
 bool VectorQueryParameters::parseNormalizedParamsWithAST(
     NormalizedQueryResult & parameters,
     const std::vector<VectorQueryPlanCache::ASTLiteralPosition> * positions,
@@ -2156,6 +2284,15 @@ bool VectorQueryParameters::parseNormalizedParamsWithAST(
     return parseNormalizedParams(parameters, target_types, literal_types, only_vector);
 }
 
+/// Rewrite bare vector array literals into explicit CAST expressions.
+/// For example, transforms:
+///   SELECT * FROM t WHERE l2distance(vec, [1.0, 2.0, 3.0]) < 0.5
+/// into:
+///   SELECT * FROM t WHERE l2distance(vec, CAST([1.0, 2.0, 3.0], 'Array(Float)')) < 0.5
+///
+/// This is used when `vector_use_cast` is enabled but plan caching is not active.
+/// Only top-level array literals inside l2distance/cosinedistance functions are rewritten.
+/// Nested arrays and function calls inside arrays are left unchanged.
 String VectorQueryParameters::rewriteVectorLiteralsToCasts(
     const char * begin,
     const char * end) const
@@ -2168,8 +2305,7 @@ String VectorQueryParameters::rewriteVectorLiteralsToCasts(
         return new_sql;
     }
 
-    // bool is_cast = false;
-    UInt32 vector_function_type = 0;
+    UInt32 vector_function_type = 0;  // 1=l2distance, 2=hastoken, 3=cosinedistance
     bool is_comma = false;
     bool is_bare_word = false;
 
@@ -2264,6 +2400,11 @@ String VectorQueryParameters::rewriteVectorLiteralsToCasts(
     return new_sql;
 }
 
+/// Parse raw parameter strings into typed Fields using type hints from QueryPlan constant bindings.
+/// For each parameter, the binding provides field_type and target_type.  VectorScan-scoped
+/// bindings with Array field type take priority over other bindings for the same parameter index.
+/// Falls back to AST positions for type hints when bindings are incomplete.
+/// Delegates to the shared parseNormalizedParams() helper.
 bool VectorQueryParameters::parseNormalizedParamsWithPlan(
     NormalizedQueryResult & parameters,
     const std::vector<VectorQueryPlanCache::PlanConstantBinding> * plan_constant_bindings,
@@ -2296,6 +2437,19 @@ bool VectorQueryParameters::parseNormalizedParamsWithPlan(
     return parseNormalizedParams(parameters, target_types, literal_types, only_vector);
 }
 
+/// Scan a built QueryPlan and match every mutable constant slot back to the ordered AST
+/// literal metadata collected earlier for the same query.
+///
+/// The algorithm:
+///   1. Walk the plan tree, collecting PlanConstantCandidate from each ExpressionStep
+///      and FilterStep's ActionsDAG (via findActionsDAGAndCollectConstants).
+///   2. For each AST literal position, find exactly one matching candidate using
+///      candidateMatchesAstLiteral() (matching on scope, identifier, function chain, value).
+///   3. If any AST literal has zero or multiple matches, the entire result is invalidated
+///      (returns empty bindings) to prevent incorrect plan reuse.
+///   4. The final bindings list is reversed to match the AST traversal order.
+///
+/// Returns an empty vector on any mismatch (logged at DEBUG level).
 std::vector<VectorQueryPlanCache::PlanConstantBinding> VectorQueryParameters::CollectQueryPlanConstants(
     QueryPlan & query_plan,
     const NormalizedQueryResult & parameters, bool only_vector)

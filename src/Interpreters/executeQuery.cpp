@@ -295,23 +295,38 @@ static bool getResultFromQueryResultCache(
     return true;
 }
 
+/// Intermediate result from the vector query plan cache restore attempt.
+/// Carries the restored AST, cached QueryPlan, rewritten SQL text, and various flags
+/// that tell executeQueryImpl whether to skip normal parsing/planning and use the
+/// cached artifacts instead.
 struct VectorQueryPlanCacheRestoreResult
 {
-    ASTPtr ast;
-    std::unique_ptr<QueryPlan> cached_plan;
-    String vector_query_for_plan_cache;
-    String new_query;
-    std::optional<Settings> settings_copy;
-    QueryResultCacheUsage query_result_cache_usage = QueryResultCacheUsage::None;
-    bool vector_ast_restored = false;
-    bool skip_ast_processing = false;
-    bool query_result_cache_hit = false;
-    bool can_use_query_result_cache = false;
-    bool is_select = false;
-    size_t params_size = 0;
-    String query_access_info_cache;
+    ASTPtr ast;                                          ///< Restored AST from cache (if AST cache hit)
+    std::unique_ptr<QueryPlan> cached_plan;              ///< Restored QueryPlan from cache (if plan cache hit)
+    String vector_query_for_plan_cache;                  ///< Normalized SQL used as the cache key
+    String new_query;                                    ///< Rewritten SQL (with CAST-wrapped vector literals)
+    std::optional<Settings> settings_copy;               ///< Snapshot of settings for query result cache consistency
+    QueryResultCacheUsage query_result_cache_usage = QueryResultCacheUsage::None;  ///< Whether a query result cache hit occurred
+    bool vector_ast_restored = false;                    ///< True if AST was successfully restored from cache
+    bool skip_ast_processing = false;                    ///< True if the restored AST can skip re-normalization
+    bool query_result_cache_hit = false;                 ///< True if the query result cache had a matching entry
+    bool can_use_query_result_cache = false;             ///< True if query result cache is eligible for this query
+    bool is_select = false;                              ///< True if the query is a SELECT statement
+    size_t params_size = 0;                              ///< Number of extracted parameters
+    String query_access_info_cache;                      ///< Serialized query access info from the cached plan
 };
 
+/// Try to restore a query from the vector query plan cache (SQL-text-based path).
+///
+/// This is the primary cache lookup path when the query arrives as raw SQL text.
+/// The flow is:
+///   1. Normalize the SQL via normalizeQueryAndExtractParams() to get a cache key.
+///   2. Look up the AST cache entry; if found, restore the AST and parse parameters.
+///   3. Look up the plan cache entry; if found, restore the QueryPlan and rewrite constants.
+///   4. Optionally check the query result cache for a fully materialized result.
+///
+/// Returns a VectorQueryPlanCacheRestoreResult with the cached artifacts (if any).
+/// On any error, the result is reset to empty and the query falls through to normal execution.
 static VectorQueryPlanCacheRestoreResult tryRestoreFromQueryPlanCache(
     const char * begin,
     const char * end,
@@ -452,6 +467,13 @@ static VectorQueryPlanCacheRestoreResult tryRestoreFromQueryPlanCache(
     return result;
 }
 
+/// Try to restore a query from the vector query plan cache (AST-based path).
+///
+/// This overload is used when the query has already been parsed into an AST (e.g. from
+/// the `vector_only_cache_query_plan` setting path).  It normalizes the AST in-place,
+/// looks up the plan cache, and restores the QueryPlan if found.
+///
+/// Returns a VectorQueryPlanCacheRestoreResult with the cached plan (if any).
 static VectorQueryPlanCacheRestoreResult tryRestoreFromQueryPlanCache(
     ASTPtr ast,
     const ContextPtr & context,
@@ -547,20 +569,24 @@ static VectorQueryPlanCacheRestoreResult tryRestoreFromQueryPlanCache(
     return result;
 }
 
+/// Output of the cache probe step in tryExecuteFromCache.
+/// Contains the restored AST, cached plan, rewritten SQL, and various flags
+/// that executeQueryImpl uses to decide whether to return early or continue with
+/// normal query execution.
 struct CacheProbeOutput
 {
-    String new_query;
-    String vector_query_for_plan_cache;
-    std::optional<Settings> settings_copy;
-    QueryResultCacheUsage query_result_cache_usage = QueryResultCacheUsage::None;
-    bool is_select = false;
-    bool enable_vector_query_plan_cache = false;
-    bool skip_ast_processing = false;
-    bool can_use_query_result_cache = false;
-    bool query_result_cache_entry_exists = false;
-    ASTPtr ast;
-    std::unique_ptr<QueryPlan> cached_plan;
-    size_t params_size = 0;
+    String new_query;                                      ///< Rewritten SQL (with CAST-wrapped vector literals)
+    String vector_query_for_plan_cache;                    ///< Normalized SQL used as the plan cache key
+    std::optional<Settings> settings_copy;                 ///< Settings snapshot for query result cache consistency
+    QueryResultCacheUsage query_result_cache_usage = QueryResultCacheUsage::None;  ///< Query result cache status
+    bool is_select = false;                                ///< True if the query is a SELECT
+    bool enable_vector_query_plan_cache = false;           ///< True if vector plan caching is enabled
+    bool skip_ast_processing = false;                      ///< True if restored AST skips re-normalization
+    bool can_use_query_result_cache = false;               ///< True if query result cache is eligible
+    bool query_result_cache_entry_exists = false;          ///< True if a query result cache entry was found
+    ASTPtr ast;                                            ///< Restored AST from cache
+    std::unique_ptr<QueryPlan> cached_plan;                ///< Restored QueryPlan from cache
+    size_t params_size = 0;                                ///< Number of extracted parameters
 };
 
 /// Log query into text log (not into system table).
@@ -1437,10 +1463,18 @@ private:
 
 using ImplicitTransactionControlExecutorPtr = std::shared_ptr<ImplicitTransactionControlExecutor>;
 
-/// Try to fully execute a query from caches (query result cache or query plan cache).
-/// If successful, returns a complete (ASTPtr, BlockIO) with pipeline/callbacks set up, allowing
-/// executeQueryImpl to return early. Otherwise returns nullopt and fills `output` with
-/// the cache probe results for the normal execution path.
+/// Try to fully execute a query from caches (query result cache or vector query plan cache).
+///
+/// This function is the main cache orchestration point.  It attempts (in order):
+///   1. Vector query plan cache restore (via tryRestoreFromQueryPlanCache).
+///   2. Query result cache lookup.
+///   3. If a cached plan was found, build a pipeline from it and optionally set up
+///      a query result cache writer for future cache population.
+///
+/// If a cached result or plan is available, returns a complete BlockIO with pipeline
+/// and callbacks set up, allowing executeQueryImpl to return early.
+/// Otherwise returns nullopt and fills `output` with the cache probe results
+/// (rewritten SQL, restored AST, flags) for the normal execution path.
 static std::optional<BlockIO> tryExecuteFromCache(
     ASTPtr ast,
     const char * begin,
