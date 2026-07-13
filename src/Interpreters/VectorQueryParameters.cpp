@@ -1148,93 +1148,93 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
         {
             const char * array_begin = token.begin;
             const char * array_end = token.end;
-            size_t depth = 1;
-            size_t array_depth = 1;
-            Token last_significant = token;
-            bool valid = true;
+            bool valid = false;
             bool is_function = false;
-            
-            std::vector<String> string_array;
-            const char * element_start = nullptr;
+            size_t array_depth = 1;
 
-            while (depth > 0)
+            // Fast path: scan raw characters to find the matching ']'.
+            // This avoids per-element Lexer tokenization (~1535 tokens for a 768-dim vector).
             {
-                Token nested = lexer.nextToken();
-                array_end = nested.end;
-
-                if (nested.isEnd() || nested.isError())
+                const char * p = token.end;
+                size_t depth = 1;
+                bool in_string = false;
+                char string_quote = '\0';
+                while (p < end && depth > 0)
                 {
-                    valid = false;
-                    break;
+                    char c = *p;
+                    if (in_string)
+                    {
+                        if (c == '\\')
+                        {
+                            ++p; // skip escaped character
+                        }
+                        else if (c == string_quote)
+                        {
+                            in_string = false;
+                        }
+                    }
+                    else if (c == '\'' || c == '"')
+                    {
+                        in_string = true;
+                        string_quote = c;
+                    }
+                    else if (c == '[')
+                    {
+                        ++array_depth;
+                        ++depth;
+                    }
+                    else if (c == ']')
+                    {
+                        --depth;
+                        if (depth == 0)
+                        {
+                            array_end = p + 1;
+                            valid = true;
+                            break;
+                        }
+                    }
+                    else if (!is_function && depth == 1 && ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'))
+                    {
+                        // Detect function calls inside the array (e.g. [toFloat32(1), ...])
+                        // Only check depth==1 to avoid false positives from nested content.
+                        is_function = true;
+                    }
+                    ++p;
                 }
-
-                if (nested.type == TokenType::BareWord)
-                    is_function = true;
-
-                if (!nested.isSignificant())
-                    continue;
-
-                if (nested.type == TokenType::OpeningSquareBracket)
-                {
-                    ++array_depth;
-                    ++depth;
-                }
-                else if (nested.type == TokenType::ClosingSquareBracket)
-                    --depth;
-
-                last_significant = nested;
+                // Advance the Lexer past the array content so subsequent tokens
+                // start after the ']'.
+                lexer.setPosition(array_end);
             }
-            if (use_cast && array_depth == 1  && !is_function && (vector_function_type == 1 || vector_function_type == 3))
+
+            if (use_cast && array_depth == 1 && !is_function && (vector_function_type == 1 || vector_function_type == 3))
             {
                 appendFunctionName(result.new_sql, FunctionNames::CAST);
                 result.new_sql += "('";
                 appendFunctionName(result.normalized_sql, FunctionNames::CAST);
                 result.normalized_sql += "(";
             }
-            
-            // Handle the last element after the loop ends
-            if (element_start && array_end > element_start)
-            {
-                // Find the position before the closing bracket
-                const char * last_element_end = array_end;
-                if (last_significant.type == TokenType::ClosingSquareBracket)
-                    last_element_end = last_significant.begin;
-                
-                if (last_element_end > element_start)
-                {
-                    String element(element_start, last_element_end - element_start);
-                    // Trim whitespace
-                    size_t start_pos = 0;
-                    size_t end_pos = element.length();
-                    while (start_pos < end_pos && isspace(static_cast<unsigned char>(element[start_pos])))
-                        ++start_pos;
-                    while (end_pos > start_pos && isspace(static_cast<unsigned char>(element[end_pos - 1])))
-                        --end_pos;
-                    if (start_pos < end_pos)
-                        string_array.emplace_back(element.data() + start_pos, end_pos - start_pos);
-                }
-            }
 
-            if (valid && depth == 0)
+            if (valid)
             {
                 String original_array(array_begin, static_cast<size_t>(array_end - array_begin));
                 result.new_sql += original_array;
-                if (array_depth == 1  && !is_function && (vector_function_type == 1 || vector_function_type == 3))
+                if (array_depth == 1 && !is_function && (vector_function_type == 1 || vector_function_type == 3))
                     result.normalized_sql += "?:array";
                 else
                     result.normalized_sql += original_array;
                 result.params.emplace_back(original_array, ParameterInfo::Type::NUMERIC_VECTOR);
-                
+
                 vector_complete = true;
                 if (num_literals_in_sequence == 0 && (vector_function_type == 1 || vector_function_type == 3))
                     hash.update("\x00", 1);
 
                 ++num_literals_in_sequence;
 
-                if (use_cast && array_depth == 1  && !is_function && (vector_function_type == 1 || vector_function_type == 3))
+                if (use_cast && array_depth == 1 && !is_function && (vector_function_type == 1 || vector_function_type == 3))
                 {
-                    result.new_sql += "','Array(Float)')";
+                    result.new_sql += "','Array(Float32)')";
                     result.normalized_sql += ",?:string)";
+                    hash.update(CAST_FUNCTION_NAME.data(), CAST_FUNCTION_NAME.size());
                 }
                 continue;
             }
@@ -2346,51 +2346,72 @@ String VectorQueryParameters::rewriteVectorLiteralsToCasts(
         {
             const char * array_begin = token.begin;
             const char * array_end = token.end;
-            size_t depth = 1;
-            size_t array_depth = 1;
-            bool valid = true;
+            bool valid = false;
             bool is_function = false;
+            size_t array_depth = 1;
 
-            while (depth > 0)
+            // Fast path: scan raw characters to find the matching ']'.
+            // This avoids per-element Lexer tokenization (~1535 tokens for a 768-dim vector).
             {
-                Token nested = lexer.nextToken();
-                array_end = nested.end;
-
-                if (nested.isEnd() || nested.isError())
+                const char * p = token.end;
+                size_t depth = 1;
+                bool in_string = false;
+                char string_quote = '\0';
+                while (p < end && depth > 0)
                 {
-                    valid = false;
-                    break;
+                    char c = *p;
+                    if (in_string)
+                    {
+                        if (c == '\\')
+                        {
+                            ++p;
+                        }
+                        else if (c == string_quote)
+                        {
+                            in_string = false;
+                        }
+                    }
+                    else if (c == '\'' || c == '"')
+                    {
+                        in_string = true;
+                        string_quote = c;
+                    }
+                    else if (c == '[')
+                    {
+                        ++array_depth;
+                        ++depth;
+                    }
+                    else if (c == ']')
+                    {
+                        --depth;
+                        if (depth == 0)
+                        {
+                            array_end = p + 1;
+                            valid = true;
+                            break;
+                        }
+                    }
+                    else if (!is_function && depth == 1 && ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'))
+                    {
+                        is_function = true;
+                    }
+                    ++p;
                 }
-
-                if (nested.type == TokenType::BareWord)
-                    is_function = true;
-
-                if (!nested.isSignificant())
-                    continue;
-
-                if (nested.type == TokenType::OpeningSquareBracket)
-                {
-                    ++array_depth;
-                    ++depth;
-                }
-                else if (nested.type == TokenType::ClosingSquareBracket)
-                    --depth;
-
+                lexer.setPosition(array_end);
             }
-            
+
             if (array_depth == 1 && !is_function)
             {
                 appendFunctionName(new_sql, FunctionNames::CAST);
                 new_sql += "('";
             }
 
-            if (valid && depth == 0)
+            if (valid)
             {
                 String original_array(array_begin, static_cast<size_t>(array_end - array_begin));
-                
-                new_sql += original_array;            
+                new_sql += original_array;
                 if (array_depth == 1 && !is_function)
-                    new_sql += "','Array(Float)')";
+                    new_sql += "','Array(Float32)')";
                 continue;
             }
         }

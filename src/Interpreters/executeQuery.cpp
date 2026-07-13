@@ -479,35 +479,14 @@ static VectorQueryPlanCacheRestoreResult tryRestoreFromQueryPlanCache(
     const ContextPtr & context,
     const Settings & settings,
     bool internal,
-    const QueryResultCachePtr & query_result_cache,
     const VectorQueryPlanCachePtr & vector_query_plan_cache,
-    BlockIO & res,
-    const LoggerPtr & logger,
-    QueryResultDetails & result_details)
+    const LoggerPtr & logger)
 {
     VectorQueryPlanCacheRestoreResult result;
     result.is_select = ast->as<ASTSelectQuery>() || ast->as<ASTSelectWithUnionQuery>();
     if (!result.is_select)
         return result;
-    result.can_use_query_result_cache = query_result_cache != nullptr
-        && settings[Setting::use_query_cache] && !internal 
-        && context->getClientInfo().query_kind == ClientInfo::QueryKind::INITIAL_QUERY;
-    
-    if (result.can_use_query_result_cache)
-        result.settings_copy = settings;
-
-    result.query_result_cache_hit = getResultFromQueryResultCache(
-        query_result_cache,
-        ast,
-        context,
-        result.settings_copy,
-        result.can_use_query_result_cache,
-        result.query_result_cache_usage,
-        res,
-        logger,
-        result_details);
-    
-    if (!result.query_result_cache_hit && vector_query_plan_cache && !internal)
+    if (vector_query_plan_cache && !internal)
     {
         const bool enable_vector_query_plan_cache = settings[Setting::vector_query_plan_cache];
         const auto dialect = settings[Setting::dialect];
@@ -1475,7 +1454,10 @@ using ImplicitTransactionControlExecutorPtr = std::shared_ptr<ImplicitTransactio
 /// and callbacks set up, allowing executeQueryImpl to return early.
 /// Otherwise returns nullopt and fills `output` with the cache probe results
 /// (rewritten SQL, restored AST, flags) for the normal execution path.
-static std::optional<BlockIO> tryExecuteFromCache(
+static std::optional<BlockIO> tryExecuteQueryPlan(
+    String query_access_info_cache,
+    bool has_cached_plan,
+    BlockIO res,
     ASTPtr ast,
     const char * begin,
     const char * end,
@@ -1489,58 +1471,15 @@ static std::optional<BlockIO> tryExecuteFromCache(
     CacheProbeOutput & output,
     QueryResultDetails & result_details)
 {
-    if (!ast && (!begin || !end))
-        return std::nullopt;
-    
     const Settings & settings = context->getSettingsRef();
-    const bool enable_vector_query_plan_cache = settings[Setting::vector_query_plan_cache];
     auto logger = getLogger("executeQuery");
     QueryResultCachePtr query_result_cache = context->getQueryResultCache();
-    VectorQueryPlanCachePtr vector_query_plan_cache = context->getVectorQueryPlanCache();
-    BlockIO res;
-    VectorQueryPlanCacheRestoreResult cache_result;
-
-    if (ast)
+    if (!query_access_info_cache.empty())
     {
-        cache_result = tryRestoreFromQueryPlanCache(
-            ast, context, settings, internal,
-            query_result_cache, vector_query_plan_cache, res, logger, result_details);
-    }   
-    else
-    {
-        cache_result = tryRestoreFromQueryPlanCache(
-            begin, end, context, settings, internal,
-            query_result_cache, vector_query_plan_cache, res, logger, result_details);
-        output.ast = std::move(cache_result.ast);
-        ast = output.ast; /// Update local ast so downstream code (e.g. QueryResultCache::Key, applySettingsFromQuery) can use it
-        output.new_query = std::move(cache_result.new_query);
-        output.vector_query_for_plan_cache = std::move(cache_result.vector_query_for_plan_cache);
-        output.skip_ast_processing = cache_result.skip_ast_processing;
-        output.params_size = cache_result.params_size;
-    }
-        
-    const char * new_begin = cache_result.new_query.empty() ? begin : cache_result.new_query.data();
-    const char * new_end = cache_result.new_query.empty() ? end : cache_result.new_query.data() + cache_result.new_query.size();
-    
-    output.settings_copy = std::move(cache_result.settings_copy);
-    output.query_result_cache_usage = cache_result.query_result_cache_usage;
-    output.is_select = cache_result.is_select;
-    output.enable_vector_query_plan_cache = enable_vector_query_plan_cache;  
-    output.can_use_query_result_cache = cache_result.can_use_query_result_cache;
-    output.query_result_cache_entry_exists = cache_result.query_result_cache_hit;
-    output.cached_plan = std::move(cache_result.cached_plan);
-    const bool has_cached_result = output.query_result_cache_entry_exists;
-    const bool has_cached_plan = output.cached_plan != nullptr;
-    if (!has_cached_result && !has_cached_plan)
-        return std::nullopt;
-    if (!ast)
-        return std::nullopt;
-    if (!cache_result.query_access_info_cache.empty())
-    {
-        auto query_access_info = context->deserializeQueryAccessInfo(cache_result.query_access_info_cache);
+        auto query_access_info = context->deserializeQueryAccessInfo(query_access_info_cache);
         context->setQueryAccessInfo(query_access_info);
     }
-    
+
     if (has_cached_plan)
     {
         auto optimization_settings = QueryPlanOptimizationSettings(context);
@@ -1597,9 +1536,8 @@ static std::optional<BlockIO> tryExecuteFromCache(
                 result_details.query_cache_entry_expires_at = expires_at;
         }
     }
-
     size_t log_queries_cut_to_length = settings[Setting::log_queries_cut_to_length];
-    String query(new_begin, new_end);
+    String query(begin, end);
     String query_for_logging = wipeSensitiveDataAndCutToLength(query, log_queries_cut_to_length, true);
     UInt64 normalized_query_hash = normalizedQueryHash(query_for_logging, false);
     InterpreterSetQuery::applySettingsFromQuery(ast, context);
@@ -1680,6 +1618,60 @@ static std::optional<BlockIO> tryExecuteFromCache(
     output.cached_plan.reset();
     return std::move(res);
 }
+static std::optional<BlockIO> tryExecuteFromCache(
+    const char * begin,
+    const char * end,
+    ContextMutablePtr context,
+    bool internal,
+    QueryProcessingStage::Enum stage,
+    const std::chrono::time_point<std::chrono::system_clock> & query_start_time,
+    const Stopwatch & start_watch,
+    const std::shared_ptr<OpenTelemetry::SpanHolder> & query_span,
+    ImplicitTransactionControlExecutorPtr implicit_tcl_executor,
+    CacheProbeOutput & output,
+    QueryResultDetails & result_details)
+{
+    if (!begin || !end)
+        return std::nullopt;
+    const Settings & settings = context->getSettingsRef();
+    const bool enable_vector_query_plan_cache = settings[Setting::vector_query_plan_cache];
+    auto logger = getLogger("executeQuery");
+    QueryResultCachePtr query_result_cache = context->getQueryResultCache();
+    VectorQueryPlanCachePtr vector_query_plan_cache = context->getVectorQueryPlanCache();
+    BlockIO res;
+
+    auto cache_result = tryRestoreFromQueryPlanCache(
+        begin, end, context, settings, internal,
+        query_result_cache, vector_query_plan_cache, res, logger, result_details);
+
+    const char * new_begin = cache_result.new_query.empty() ? begin : cache_result.new_query.data();
+    const char * new_end = cache_result.new_query.empty() ? end : cache_result.new_query.data() + cache_result.new_query.size();
+
+    output.new_query = std::move(cache_result.new_query);
+    output.vector_query_for_plan_cache = std::move(cache_result.vector_query_for_plan_cache);
+    output.settings_copy = std::move(cache_result.settings_copy);
+    output.query_result_cache_usage = cache_result.query_result_cache_usage;
+    output.is_select = cache_result.is_select;
+    output.enable_vector_query_plan_cache = enable_vector_query_plan_cache;
+    output.skip_ast_processing = cache_result.skip_ast_processing;
+    output.can_use_query_result_cache = cache_result.can_use_query_result_cache;
+    output.query_result_cache_entry_exists = cache_result.query_result_cache_hit;
+    output.ast = std::move(cache_result.ast);
+    output.cached_plan = std::move(cache_result.cached_plan);
+    output.params_size = cache_result.params_size;   
+
+    const bool has_cached_result = output.query_result_cache_entry_exists;
+    const bool has_cached_plan = output.cached_plan != nullptr;
+
+    if (!has_cached_result && !has_cached_plan)
+        return std::nullopt;
+
+    ASTPtr ast = output.ast;
+    if (!ast)
+        return std::nullopt;
+    return tryExecuteQueryPlan(cache_result.query_access_info_cache, has_cached_plan, std::move(res), ast, new_begin, new_end, context, internal, stage,
+                                query_start_time, start_watch, query_span, implicit_tcl_executor, output, result_details);
+}
 
 static BlockIO executeQueryImpl(
     const char * begin,
@@ -1740,9 +1732,10 @@ static BlockIO executeQueryImpl(
     if (internal || client_info.query_kind == ClientInfo::QueryKind::SECONDARY_QUERY)
         max_query_size = 0;
 
+    auto logger = getLogger("executeQuery");
     const bool vector_only_cache_query_plan = settings[Setting::vector_only_cache_query_plan];
+    const bool enable_vector_query_plan_cache = settings[Setting::vector_query_plan_cache];
     CacheProbeOutput cache_output;
-    bool enable_vector_query_plan_cache = cache_output.enable_vector_query_plan_cache;
     bool is_select = false;
     bool skip_ast_processing = false;
     bool can_use_query_result_cache = false;
@@ -1755,12 +1748,11 @@ static BlockIO executeQueryImpl(
     if (!vector_only_cache_query_plan)
     {
         if (auto cached_result = tryExecuteFromCache(
-            nullptr, begin, end, context, internal, stage,
+            begin, end, context, internal, stage,
             query_start_time, start_watch, query_span, implicit_tcl_executor, cache_output, result_details))
         {
             return std::move(*cached_result);
         }
-        enable_vector_query_plan_cache = cache_output.enable_vector_query_plan_cache;
         is_select = cache_output.is_select;
         skip_ast_processing = cache_output.skip_ast_processing;
         can_use_query_result_cache = cache_output.can_use_query_result_cache;
@@ -1781,13 +1773,6 @@ static BlockIO executeQueryImpl(
             new_query = parameterizer.rewriteVectorLiteralsToCasts(begin, end);
         }
     }
-    
-        
-    auto logger = getLogger("executeQuery");
-    QueryResultCachePtr query_result_cache = context->getQueryResultCache();
-    VectorQueryPlanCachePtr vector_query_plan_cache = context->getVectorQueryPlanCache();
-    BlockIO res;
-    std::shared_ptr<VectorQueryPlanCache::Writer> vector_query_plan_cache_writer;
     
     const char * new_begin = new_query.empty() ? begin : new_query.data();
     const char * new_end = new_query.empty() ? end : new_query.data() + new_query.size();
@@ -2051,30 +2036,35 @@ static BlockIO executeQueryImpl(
             logExceptionBeforeStart(query_for_logging, normalized_query_hash, context, out_ast, query_span, start_watch.elapsedMilliseconds(), internal, log_as_internal);
             throw;
         }
-    }
-    
+    }   
+
     /// Avoid early destruction of process_list_entry if it was not saved to `res` yet (in case of exception)
     ProcessList::EntryPtr process_list_entry;
     QueryMetadataCachePtr query_metadata_cache;
-    
+
+    QueryResultCachePtr query_result_cache = context->getQueryResultCache();
+    VectorQueryPlanCachePtr vector_query_plan_cache = context->getVectorQueryPlanCache();
+    BlockIO res;
+    std::shared_ptr<VectorQueryPlanCache::Writer> vector_query_plan_cache_writer;
+
     String query_database;
     String query_table;
     
-    if (vector_only_cache_query_plan)
-    {
-        if (auto cached_result = tryExecuteFromCache(
-            out_ast, begin, end, context, internal, stage,
-            query_start_time, start_watch, query_span, implicit_tcl_executor, cache_output, result_details))
-        {
-            return std::move(*cached_result);
-        }
-        enable_vector_query_plan_cache = cache_output.enable_vector_query_plan_cache;
-        is_select = cache_output.is_select;
-        can_use_query_result_cache = cache_output.can_use_query_result_cache;
-        query_result_cache_entry_exists = cache_output.query_result_cache_entry_exists;
-        settings_copy = std::move(cache_output.settings_copy);
-        query_result_cache_usage = cache_output.query_result_cache_usage;
-    }
+    // if (vector_only_cache_query_plan)
+    // {
+    //     if (auto cached_result = tryExecuteFromCache(
+    //         out_ast, begin, end, context, internal, stage,
+    //         query_start_time, start_watch, query_span, implicit_tcl_executor, cache_output, result_details))
+    //     {
+    //         return std::move(*cached_result);
+    //     }
+    //     enable_vector_query_plan_cache = cache_output.enable_vector_query_plan_cache;
+    //     is_select = cache_output.is_select;
+    //     can_use_query_result_cache = cache_output.can_use_query_result_cache;
+    //     query_result_cache_entry_exists = cache_output.query_result_cache_entry_exists;
+    //     settings_copy = std::move(cache_output.settings_copy);
+    //     query_result_cache_usage = cache_output.query_result_cache_usage;
+    // }
 
     try
     {
@@ -2403,124 +2393,145 @@ static BlockIO executeQueryImpl(
                     query_metadata_cache = std::make_shared<QueryMetadataCache>();
                     context->setQueryMetadataCache(query_metadata_cache);
                 }
-
-                if (out_ast)
-                    interpreter = InterpreterFactory::instance().get(out_ast, context, SelectQueryOptions(stage).setInternal(internal));
-
-                const auto & query_settings = context->getSettingsRef();
-                if (interpreter && context->getCurrentTransaction() && query_settings[Setting::throw_on_unsupported_query_inside_transaction])
+                auto cache_result = tryRestoreFromQueryPlanCache(out_ast, context, settings, internal, vector_query_plan_cache, logger);
+                is_select = cache_result.is_select;
+                const bool has_cached_plan = cache_result.cached_plan != nullptr;
+                if (!has_cached_plan)
                 {
-                    if (!interpreter->supportsTransactions())
-                        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Transactions are not supported for this type of query ({})", out_ast->getID());
+                    if (out_ast)
+                        interpreter = InterpreterFactory::instance().get(out_ast, context, SelectQueryOptions(stage).setInternal(internal));
 
-                    if (query_settings[Setting::apply_mutations_on_fly])
-                        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Transactions are not supported with enabled setting 'apply_mutations_on_fly'");
-                }
-
-                // InterpreterSelectQueryAnalyzer does not build QueryPlan in the constructor.
-                // We need to force to build it here to check if we need to ignore quota.
-                if (auto * interpreter_with_analyzer = dynamic_cast<InterpreterSelectQueryAnalyzer *>(interpreter.get()))
-                    interpreter_with_analyzer->getQueryPlan();
-
-                if (!(interpreter && interpreter->ignoreQuota()) && !quota_checked)
-                {
-                    quota = context->getQuota();
-                    if (quota)
+                    const auto & query_settings = context->getSettingsRef();
+                    if (interpreter && context->getCurrentTransaction() && query_settings[Setting::throw_on_unsupported_query_inside_transaction])
                     {
-                        /// Each governing quota is accounted appropriately: NORMALIZED_QUERY_HASH
-                        /// quotas track against per-hash intervals, the rest against shared session
-                        /// intervals. A user may be governed by several quotas of different key types.
-                        if (query_plan || out_ast->as<ASTSelectQuery>() || out_ast->as<ASTSelectWithUnionQuery>())
-                            quota->usedForQuery(normalized_query_hash, QuotaType::QUERY_SELECTS, 1);
-                        else if (out_ast->as<ASTInsertQuery>())
-                            quota->usedForQuery(normalized_query_hash, QuotaType::QUERY_INSERTS, 1);
-                        quota->usedForQuery(normalized_query_hash, QuotaType::QUERIES, 1);
-                        quota->usedForQuery(normalized_query_hash, QuotaType::ERRORS, 0, /* check_exceeded = */ true);
+                        if (!interpreter->supportsTransactions())
+                            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Transactions are not supported for this type of query ({})", out_ast->getID());
 
-                        /// Track per-normalized-query-hash quota limits (works for all key types).
-                        quota->usedPerNormalizedHash(normalized_query_hash);
-                    }
-                }
-
-                /// Invoke HTTP 100-Continue callback after quota checks are completed
-                if (http_continue_callback && !internal)
-                    http_continue_callback();
-
-                if (interpreter)
-                {
-                    interpreter->is_internal = internal;
-                    if (enable_vector_query_plan_cache && !skip_ast_processing)
-                    {
-                        interpreter->params_size = params_size;
-                        interpreter->is_select = is_select;
-                        interpreter->setVectorQueryString(vector_query_for_plan_cache.empty() ? query : vector_query_for_plan_cache);
-                    }
-                    if (!interpreter->ignoreLimits())
-                    {
-                        limits.mode = LimitsMode::LIMITS_CURRENT;
-                        limits.size_limits = SizeLimits(settings[Setting::max_result_rows], settings[Setting::max_result_bytes], settings[Setting::result_overflow_mode]);
+                        if (query_settings[Setting::apply_mutations_on_fly])
+                            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Transactions are not supported with enabled setting 'apply_mutations_on_fly'");
                     }
 
-                    if (auto * create_interpreter = typeid_cast<InterpreterCreateQuery *>(interpreter.get()))
-                    {
-                        create_interpreter->setIsRestoreFromBackup(flags.distributed_backup_restore);
-                        create_interpreter->setInternal(internal);
-                    }
+                    // InterpreterSelectQueryAnalyzer does not build QueryPlan in the constructor.
+                    // We need to force to build it here to check if we need to ignore quota.
+                    if (auto * interpreter_with_analyzer = dynamic_cast<InterpreterSelectQueryAnalyzer *>(interpreter.get()))
+                        interpreter_with_analyzer->getQueryPlan();
 
-                    std::unique_ptr<OpenTelemetry::SpanHolder> span;
-                    if (OpenTelemetry::CurrentContext().isTraceEnabled())
+                    if (!(interpreter && interpreter->ignoreQuota()) && !quota_checked)
                     {
-                        auto * raw_interpreter_ptr = interpreter.get();
-                        String class_name = raw_interpreter_ptr ? demangle(typeid(*raw_interpreter_ptr).name()) : "QueryPlan";
-                        span = std::make_unique<OpenTelemetry::SpanHolder>(class_name + "::execute()");
-                    }
-
-                    res = interpreter->execute();
-                    if (is_select && enable_vector_query_plan_cache && !VectorQueryPlanCache::containsSubquery(out_ast))
-                    {
-                        vector_query_plan_cache_writer = interpreter->getVectorQueryPlanCacheWriter();
-                    }
-                    /// If it is a non-internal SELECT query, and active (write) use of the query cache is enabled, then add a processor on
-                    /// top of the pipeline which stores the result in the query cache.
-                    if (checkCanWriteQueryResultCache(out_ast, context))
-                    {
-                        auto created_at = std::chrono::system_clock::now();
-                        auto expires_at = created_at + std::chrono::seconds(settings[Setting::query_cache_ttl].totalSeconds());
-
-                        QueryResultCache::Key key(
-                            out_ast, context->getCurrentDatabase(), *settings_copy, res.pipeline.getSharedHeader(),
-                            context->getCurrentQueryId(),
-                            context->getUserID(), context->getCurrentRoles(),
-                            settings[Setting::query_cache_share_between_users],
-                            created_at, expires_at,
-                            settings[Setting::query_cache_compress_entries],
-                            /* is_subquery = */ false);
-
-                        const size_t num_query_runs = settings[Setting::query_cache_min_query_runs] ? query_result_cache->recordQueryRun(key) : 1; /// try to avoid locking a mutex in recordQueryRun()
-                        if (num_query_runs <= settings[Setting::query_cache_min_query_runs])
+                        quota = context->getQuota();
+                        if (quota)
                         {
-                            LOG_TRACE(getLogger("QueryResultCache"),
-                                "Skipped insert because the query ran {} times but the minimum required number of query runs to cache the query result is {}",
-                                num_query_runs, settings[Setting::query_cache_min_query_runs].value);
+                            /// Each governing quota is accounted appropriately: NORMALIZED_QUERY_HASH
+                            /// quotas track against per-hash intervals, the rest against shared session
+                            /// intervals. A user may be governed by several quotas of different key types.
+                            if (query_plan || out_ast->as<ASTSelectQuery>() || out_ast->as<ASTSelectWithUnionQuery>())
+                                quota->usedForQuery(normalized_query_hash, QuotaType::QUERY_SELECTS, 1);
+                            else if (out_ast->as<ASTInsertQuery>())
+                                quota->usedForQuery(normalized_query_hash, QuotaType::QUERY_INSERTS, 1);
+                            quota->usedForQuery(normalized_query_hash, QuotaType::QUERIES, 1);
+                            quota->usedForQuery(normalized_query_hash, QuotaType::ERRORS, 0, /* check_exceeded = */ true);
+
+                            /// Track per-normalized-query-hash quota limits (works for all key types).
+                            quota->usedPerNormalizedHash(normalized_query_hash);
                         }
-                        else
+                    }
+
+                    /// Invoke HTTP 100-Continue callback after quota checks are completed
+                    if (http_continue_callback && !internal)
+                        http_continue_callback();
+
+                    if (interpreter)
+                    {
+                        interpreter->is_internal = internal;
+                        if (enable_vector_query_plan_cache && !skip_ast_processing)
                         {
-                            auto query_result_cache_writer = std::make_shared<QueryResultCacheWriter>(query_result_cache->createWriter(
-                                key,
-                                std::chrono::milliseconds(settings[Setting::query_cache_min_query_duration].totalMilliseconds()),
-                                settings[Setting::query_cache_squash_partial_results],
-                                settings[Setting::max_block_size],
-                                settings[Setting::query_cache_max_size_in_bytes],
-                                settings[Setting::query_cache_max_entries]));
-                            res.pipeline.writeResultIntoQueryResultCache(query_result_cache_writer);
-                            query_result_cache_usage = QueryResultCacheUsage::Write;
+                            interpreter->params_size = params_size;
+                            interpreter->is_select = is_select;
+                            interpreter->setVectorQueryString(vector_query_for_plan_cache.empty() ? query : vector_query_for_plan_cache);
+                        }
+                        if (!interpreter->ignoreLimits())
+                        {
+                            limits.mode = LimitsMode::LIMITS_CURRENT;
+                            limits.size_limits = SizeLimits(settings[Setting::max_result_rows], settings[Setting::max_result_bytes], settings[Setting::result_overflow_mode]);
                         }
 
-                        /// We will expose the info in HTTP headers, but only if the cache is enabled for reading (otherwise browsers should not cache either)
-                        /// Set only "expires_at", not "Age" as the entry has not aged at this moment in time.
-                        if (settings[Setting::enable_reads_from_query_cache])
-                            result_details.query_cache_entry_expires_at = expires_at;
+                        if (auto * create_interpreter = typeid_cast<InterpreterCreateQuery *>(interpreter.get()))
+                        {
+                            create_interpreter->setIsRestoreFromBackup(flags.distributed_backup_restore);
+                            create_interpreter->setInternal(internal);
+                        }
+
+                        std::unique_ptr<OpenTelemetry::SpanHolder> span;
+                        if (OpenTelemetry::CurrentContext().isTraceEnabled())
+                        {
+                            auto * raw_interpreter_ptr = interpreter.get();
+                            String class_name = raw_interpreter_ptr ? demangle(typeid(*raw_interpreter_ptr).name()) : "QueryPlan";
+                            span = std::make_unique<OpenTelemetry::SpanHolder>(class_name + "::execute()");
+                        }
+
+                        res = interpreter->execute();
+                        if (is_select && enable_vector_query_plan_cache && !VectorQueryPlanCache::containsSubquery(out_ast))
+                        {
+                            vector_query_plan_cache_writer = interpreter->getVectorQueryPlanCacheWriter();
+                        }
                     }
+                }
+                else
+                {
+                    auto optimization_settings = QueryPlanOptimizationSettings(context);
+                    auto build_pipeline_settings = BuildQueryPipelineSettings(context);
+
+                    auto query_cached_builder = cache_result.cached_plan->buildQueryPipeline(optimization_settings, build_pipeline_settings, true);
+                    res.pipeline = QueryPipelineBuilder::getPipeline(std::move(*query_cached_builder));
+
+                    limits.mode = LimitsMode::LIMITS_CURRENT;
+                    limits.size_limits = SizeLimits(settings[Setting::max_result_rows], settings[Setting::max_result_bytes], settings[Setting::result_overflow_mode]);
+                    if (stage == QueryProcessingStage::Complete && res.pipeline.pulling())
+                    {
+                        quota = context->getQuota();
+                        res.pipeline.setLimitsAndQuota(limits, quota);
+                    } 
+                }
+                /// If it is a non-internal SELECT query, and active (write) use of the query cache is enabled, then add a processor on
+                /// top of the pipeline which stores the result in the query cache.
+                if (checkCanWriteQueryResultCache(out_ast, context))
+                {
+                    auto created_at = std::chrono::system_clock::now();
+                    auto expires_at = created_at + std::chrono::seconds(settings[Setting::query_cache_ttl].totalSeconds());
+
+                    QueryResultCache::Key key(
+                        out_ast, context->getCurrentDatabase(), *settings_copy, res.pipeline.getSharedHeader(),
+                        context->getCurrentQueryId(),
+                        context->getUserID(), context->getCurrentRoles(),
+                        settings[Setting::query_cache_share_between_users],
+                        created_at, expires_at,
+                        settings[Setting::query_cache_compress_entries],
+                        /* is_subquery = */ false);
+
+                    const size_t num_query_runs = settings[Setting::query_cache_min_query_runs] ? query_result_cache->recordQueryRun(key) : 1; /// try to avoid locking a mutex in recordQueryRun()
+                    if (num_query_runs <= settings[Setting::query_cache_min_query_runs])
+                    {
+                        LOG_TRACE(getLogger("QueryResultCache"),
+                            "Skipped insert because the query ran {} times but the minimum required number of query runs to cache the query result is {}",
+                            num_query_runs, settings[Setting::query_cache_min_query_runs].value);
+                    }
+                    else
+                    {
+                        auto query_result_cache_writer = std::make_shared<QueryResultCacheWriter>(query_result_cache->createWriter(
+                            key,
+                            std::chrono::milliseconds(settings[Setting::query_cache_min_query_duration].totalMilliseconds()),
+                            settings[Setting::query_cache_squash_partial_results],
+                            settings[Setting::max_block_size],
+                            settings[Setting::query_cache_max_size_in_bytes],
+                            settings[Setting::query_cache_max_entries]));
+                        res.pipeline.writeResultIntoQueryResultCache(query_result_cache_writer);
+                        query_result_cache_usage = QueryResultCacheUsage::Write;
+                    }
+
+                    /// We will expose the info in HTTP headers, but only if the cache is enabled for reading (otherwise browsers should not cache either)
+                    /// Set only "expires_at", not "Age" as the entry has not aged at this moment in time.
+                    if (settings[Setting::enable_reads_from_query_cache])
+                        result_details.query_cache_entry_expires_at = expires_at;
                 }
             }
         }
