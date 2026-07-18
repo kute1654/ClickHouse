@@ -4,6 +4,7 @@
 #include <Core/Types.h>
 #include <Interpreters/Cache/VectorQueryPlanCache.h>
 #include <Parsers/IAST_fwd.h>
+#include <Common/SettingsChanges.h>
 
 #include <string_view>
 #include <vector>
@@ -116,6 +117,12 @@ public:
         std::vector<VectorQueryPlanCache::ASTLiteralPosition> ast_literal_position_list;
     };
 
+    struct LightParseResult
+    {
+        SettingsChanges changes;
+        bool is_select = false;
+    };
+
     /// Walk the AST and collect positions of all cacheable literal nodes.
     /// Each position records the AST path, enclosing function chain, identifier name,
     /// step type, and target data type.  When `only_vector` is true, only literals
@@ -188,6 +195,12 @@ public:
         const char * end,
         bool only_vector = false,
         bool is_cast = false);
+
+    /// Light-weight lexer-only scan for vector settings in top-level query SETTINGS clauses.
+    /// This is used before the full SQL parse so vector cache/cast gates can see per-query overrides.
+    LightParseResult parseVectorSettingsFromQuery(
+        const char * begin,
+        const char * end) const;
 
     /// Scan a built QueryPlan and match every mutable constant slot back to the
     /// ordered AST literal metadata collected earlier for the same query.

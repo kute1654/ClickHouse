@@ -1,6 +1,7 @@
 #include <Interpreters/VectorQueryParameters.h>
 
 #include <Core/Defines.h>
+#include <Core/Settings.h>
 #include <Core/Types.h>
 #include <Formats/FormatSettings.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -98,14 +99,14 @@ bool tokenIsKeyWord(const String & token_name)
 /// When the preceding token is a value, the '-' is an arithmetic operator (e.g. "a - 1"),
 /// not the start of a negative number literal (e.g. "WHERE x = -1").
 bool tokenIsValue(Token token)
-{        
+{
     if (token.type == TokenType::Comma || token.type == TokenType::OpeningRoundBracket || token.type == TokenType::OpeningSquareBracket ||
-        token.type == TokenType::Equals || token.type == TokenType::NotEquals || token.type == TokenType::Less || token.type == TokenType::Greater || 
-        token.type == TokenType::LessOrEquals || token.type == TokenType::GreaterOrEquals || 
+        token.type == TokenType::Equals || token.type == TokenType::NotEquals || token.type == TokenType::Less || token.type == TokenType::Greater ||
+        token.type == TokenType::LessOrEquals || token.type == TokenType::GreaterOrEquals ||
         (token.type == TokenType::BareWord && tokenIsKeyWord(std::string(token.begin, token.size())))
         )
         return false;
-    return true;            
+    return true;
 }
 
 /// Determine whether a function's arguments can be safely normalized (replaced with '?')
@@ -155,32 +156,31 @@ bool functionCanCache(const String & function_name)
         fun_name == "h3tochildren" ||
         fun_name == "h3fromchildren" ||
         fun_name == "geodesyazimuth" ||
-        fun_name == "printf" || 
-        fun_name == "xxhash64" || 
-        fun_name == "xxhash32" || 
-        fun_name == "cityhash64" || 
-        fun_name == "cityhash32" || 
+        fun_name == "printf" ||
+        fun_name == "xxhash64" ||
+        fun_name == "xxhash32" ||
+        fun_name == "cityhash64" ||
         fun_name == "cityhash32" ||
-        fun_name == "hasanytokens" || 
+        fun_name == "cityhash32" ||
+        fun_name == "hasanytokens" ||
         fun_name == "hasalltokens" ||
-        fun_name == "hasphrase" ||  
-        fun_name == "interval" || 
-        fun_name == "profileevents" || 
-        fun_name == "settings" || 
-        fun_name == "tonullable" || 
+        fun_name == "hasphrase" ||
+        fun_name == "interval" ||
+        fun_name == "profileevents" ||
+        fun_name == "tonullable" ||
         // rand functions
-        fun_name == "rand" || 
-        fun_name == "rand64" || 
-        fun_name == "randcanonical" || 
-        fun_name == "randconstant" || 
-        fun_name == "randuniform" || 
-        fun_name == "randnormal" || 
-        fun_name == "randomstring" || 
-        fun_name == "randomstringutf8" || 
-        fun_name == "randomprintableascii" || 
-        fun_name == "randomfixedstring" || 
+        fun_name == "rand" ||
+        fun_name == "rand64" ||
+        fun_name == "randcanonical" ||
+        fun_name == "randconstant" ||
+        fun_name == "randuniform" ||
+        fun_name == "randnormal" ||
+        fun_name == "randomstring" ||
+        fun_name == "randomstringutf8" ||
+        fun_name == "randomprintableascii" ||
+        fun_name == "randomfixedstring" ||
         // Timezone-related functions - timezone affects query result
-        fun_name == "datetrunc" || 
+        fun_name == "datetrunc" ||
         fun_name == "todate" ||
         fun_name == "todate32" ||
         fun_name == "todatetime" ||
@@ -391,7 +391,7 @@ bool parseNumberLiteralFast(std::string_view literal, Field & result)
         ReadBufferFromMemory buf(clean_literal.data(), clean_literal.size());
         Int64 int_value;
         UInt64 uint_value;
-        
+
         // Try signed integer first
         if (negative)
         {
@@ -422,37 +422,37 @@ bool stringToNumericArrayField(std::string_view literal, const DataTypePtr & tar
 {
     if (!target_type)
         return false;
-    
+
     // Check if target type is Array type
     const DataTypeArray * array_type = typeid_cast<const DataTypeArray *>(target_type.get());
     if (!array_type)
         return false;
-    
+
     try
     {
         // Get the serialization for the target array type
         auto array_serialization = target_type->getDefaultSerialization();
-        
+
         // Create a column to hold the result
         auto result_column = target_type->createColumn();
-        
+
         // Create read buffer from the literal string
         ReadBufferFromMemory read_buffer(literal.data(), literal.size());
-        
+
         // Use format settings (can be customized if needed)
         FormatSettings format_settings;
-        
+
         // Directly deserialize the whole text into the column
         // This bypasses the castColumn overhead and goes straight to serialization
         array_serialization->deserializeWholeText(*result_column, read_buffer, format_settings);
-        
+
         // Verify that the entire input was consumed
         if (!read_buffer.eof())
         {
             // There's unexpected data after parsing, treat as failure
             return false;
         }
-        
+
         // Extract the Field from the column
         result_column->get(0, result);
         return true;
@@ -636,13 +636,13 @@ bool candidateMatchesAstLiteral(
             for (size_t i = number; i > 0; i--)
             {
                 if (position.function_list[i - 1] != candidate.function_names[i - 1])
-                    return false;     
+                    return false;
             }
         }
     }
     if (ast_index < parameters.parsed_params.size())
     {
-        if (parameters.parsed_params[ast_index].getType() == Field::Types::String && 
+        if (parameters.parsed_params[ast_index].getType() == Field::Types::String &&
             position.field_type == Field::Types::Array)
         {
             if (candidate.value.getType() != Field::Types::String && candidate.binding.target_type)
@@ -791,9 +791,9 @@ void findActionsDAGAndCollectConstants(
                         candidate.value = value;
                         candidate.step_type = step_type;
                         candidate.function_names = function_names;
-                        candidate.identifier_names = current_field_name;  
+                        candidate.identifier_names = current_field_name;
                         out_candidates.push_back(candidate);
-                    }                 
+                    }
                 }
                 break;
             }
@@ -811,7 +811,7 @@ void findActionsDAGAndCollectConstants(
             if (should_clear_and_return)
                 out_candidates.clear();
         }
-    }       
+    }
 
     std::unordered_map<UInt32, std::vector<size_t>> node_index_to_candidate_indices;
     for (size_t i = 0; i < out_candidates.size(); ++i)
@@ -936,6 +936,27 @@ bool tokenMatchesBareWord(Token token, std::string_view bare_word_name)
     return true;
 }
 
+bool isVectorPreparseSettingName(std::string_view name)
+{
+    return name == "vector_query_plan_cache"
+        || name == "vector_only_cache_query_plan"
+        || name == "vector_query_plan_cache_only_vector"
+        || name == "vector_use_cast";
+}
+
+std::optional<Field> tokenToSettingField(Token token)
+{
+    if (token.type == TokenType::StringLiteral)
+    {
+        Field value;
+        parseStringLiteral(std::string_view(token.begin, token.size()), value);
+        return value;
+    }
+    if (token.type == TokenType::Number || token.type == TokenType::BareWord)
+        return Field(String(token.begin, token.size()));
+    return std::nullopt;
+}
+
 /// Core parsing routine shared by the AST and QueryPlan paths.
 /// Iterates over `parameters.params`, converts each raw string token into a typed Field
 /// using the provided type hints (`target_types`, `literal_types`), and populates
@@ -1003,6 +1024,137 @@ bool parseNormalizedParams(
 
 }
 
+VectorQueryParameters::LightParseResult VectorQueryParameters::parseVectorSettingsFromQuery(
+    const char * begin,
+    const char * end) const
+{
+    VectorQueryParameters::LightParseResult result;
+    if (!begin || !end || begin >= end)
+        return result;
+
+    Lexer lexer(begin, end);
+    if (!isSelectStatement(lexer))
+        return result;
+    result.is_select = true;
+    bool is_from = false;
+    bool start_system_table_check = false;
+    bool is_settings = false;
+    std::string_view setting_name;
+    bool setting_has_name = false;
+    bool setting_is_vector = false;
+    bool setting_expect_value = false;
+
+    while (true)
+    {
+        Token token = lexer.nextToken();
+        if (token.isEnd() || token.isError() || token.type == TokenType::Semicolon)
+            break;
+        if (!token.isSignificant())
+            continue;
+
+        if (start_system_table_check)
+        {
+            start_system_table_check = false;
+            if (token.type == TokenType::BareWord && token.size() == 6 && tokenMatchesBareWord(token, "system"))
+            {
+                result.is_select = false;
+                LOG_DEBUG(logger, "not support system table, sql({})", std::string(begin, end));
+                return result;
+            }
+        }
+
+        if (token.type == TokenType::BareWord && token.size() == 4 && tokenMatchesBareWord(token, "from"))
+        {
+            is_from = true;
+            start_system_table_check = true;
+        }
+        if (is_from && token.type == TokenType::BareWord && token.size() == 6 && tokenMatchesBareWord(token, "select"))
+        {
+            result.is_select = false;
+            LOG_DEBUG(logger, "not support subquery, sql({})", std::string(begin, end));
+            return result;
+        }
+        if (is_settings)
+        {
+            if (!setting_expect_value && token.type == TokenType::BareWord && token.size() == 6 && tokenMatchesBareWord(token, "format"))
+            {
+                if (setting_has_name && setting_is_vector && !setting_expect_value)
+                    result.changes.setSetting(setting_name, Settings::castValueUtil(setting_name, Field(true)));
+
+                setting_name = {};
+                setting_has_name = false;
+                setting_is_vector = false;
+                setting_expect_value = false;
+                is_settings = false;
+                continue;
+            }
+
+            if (token.type == TokenType::Comma)
+            {
+                if (setting_has_name && setting_is_vector && !setting_expect_value)
+                    result.changes.setSetting(setting_name, Settings::castValueUtil(setting_name, Field(true)));
+
+                setting_name = {};
+                setting_has_name = false;
+                setting_is_vector = false;
+                setting_expect_value = false;
+                continue;
+            }
+
+            if (!setting_has_name)
+            {
+                if (token.type == TokenType::BareWord)
+                {
+                    setting_name = std::string_view(token.begin, token.size());
+                    setting_has_name = true;
+                    setting_is_vector = isVectorPreparseSettingName(setting_name);
+                    setting_expect_value = false;
+                }
+                continue;
+            }
+
+            if (!setting_expect_value && token.type == TokenType::Equals)
+            {
+                setting_expect_value = true;
+                continue;
+            }
+
+            if (setting_expect_value)
+            {
+                if (setting_is_vector)
+                {
+                    if (token.type == TokenType::BareWord && token.size() == 7 && tokenMatchesBareWord(token, "default"))
+                    {
+                        Settings default_settings;
+                        result.changes.setSetting(setting_name, default_settings.get(setting_name));
+                    }
+                    else if (auto value = tokenToSettingField(token))
+                        result.changes.setSetting(setting_name, Settings::castValueUtil(setting_name, *value));
+                }
+
+                setting_name = {};
+                setting_has_name = false;
+                setting_is_vector = false;
+                setting_expect_value = false;
+                continue;
+            }
+
+            setting_name = {};
+            setting_has_name = false;
+            setting_is_vector = false;
+            setting_expect_value = false;
+            continue;
+        }
+        if (is_from && token.type == TokenType::BareWord && token.size() == 8 && tokenMatchesBareWord(token, "settings"))
+            is_settings = true;
+    }
+
+    if (is_settings && setting_has_name && setting_is_vector && !setting_expect_value)
+        result.changes.setSetting(setting_name, Settings::castValueUtil(setting_name, Field(true)));
+
+    return result;
+}
+
 /// Tokenize the raw SQL text and produce a normalized cache key plus extracted parameters.
 ///
 /// This function does two jobs at once:
@@ -1030,13 +1182,6 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
     SipHash hash;
     Lexer lexer(begin, end);
 
-    if (!isSelectStatement(lexer))
-    {
-        result.hash = 0;
-        result.normalized_sql = "";
-        LOG_DEBUG(logger, "sql({}) has not begin with select", std::string(begin, end));
-        return result;
-    }
     size_t num_literals_in_sequence = 0;
     bool parse_params = true;
     bool is_cast = false;
@@ -1054,8 +1199,6 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
     bool is_bare_word = false;
     bool is_dot = false;
     bool is_negative = false;
-    bool is_from = false;
-    bool start_system_table_check = false;
     bool previous_is_value = false;
 
     while (true)
@@ -1067,7 +1210,7 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
             result.normalized_sql += std::string(token.begin, token.size());
             result.new_sql += std::string(token.begin, token.size());
             break;
-        } 
+        }
         if (token.type == TokenType::Whitespace)
         {
             hash.update(token.begin, token.size());
@@ -1079,7 +1222,7 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
         {
             result.new_sql += std::string(token.begin, token.size());
             continue;
-        } 
+        }
         if (token.isEnd() || token.isError())
             break;
         if (token.type == TokenType::BareWord && !tokenCanCache(token))
@@ -1129,7 +1272,7 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
         }
         if (is_comma && token.type == TokenType::StringLiteral &&
                 (vector_function_type == 2 ||
-                    (is_cast && 
+                    (is_cast &&
                         (vector_function_type == 1 || vector_function_type == 3)
                     )
                 )
@@ -1148,65 +1291,43 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
         {
             const char * array_begin = token.begin;
             const char * array_end = token.end;
-            bool valid = false;
-            bool is_function = false;
+            size_t depth = 1;
             size_t array_depth = 1;
+            Token last_significant = token;
+            bool valid = true;
+            bool is_function = false;
 
-            // Fast path: scan raw characters to find the matching ']'.
-            // This avoids per-element Lexer tokenization (~1535 tokens for a 768-dim vector).
+            std::vector<String> string_array;
+            const char * element_start = nullptr;
+
+            while (depth > 0)
             {
-                const char * p = token.end;
-                size_t depth = 1;
-                bool in_string = false;
-                char string_quote = '\0';
-                while (p < end && depth > 0)
-                {
-                    char c = *p;
-                    if (in_string)
-                    {
-                        if (c == '\\')
-                        {
-                            ++p; // skip escaped character
-                        }
-                        else if (c == string_quote)
-                        {
-                            in_string = false;
-                        }
-                    }
-                    else if (c == '\'' || c == '"')
-                    {
-                        in_string = true;
-                        string_quote = c;
-                    }
-                    else if (c == '[')
-                    {
-                        ++array_depth;
-                        ++depth;
-                    }
-                    else if (c == ']')
-                    {
-                        --depth;
-                        if (depth == 0)
-                        {
-                            array_end = p + 1;
-                            valid = true;
-                            break;
-                        }
-                    }
-                    else if (!is_function && depth == 1 && ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'))
-                    {
-                        // Detect function calls inside the array (e.g. [toFloat32(1), ...])
-                        // Only check depth==1 to avoid false positives from nested content.
-                        is_function = true;
-                    }
-                    ++p;
-                }
-                // Advance the Lexer past the array content so subsequent tokens
-                // start after the ']'.
-                lexer.setPosition(array_end);
-            }
+                Token nested = lexer.nextToken();
+                array_end = nested.end;
 
-            if (use_cast && array_depth == 1 && !is_function && (vector_function_type == 1 || vector_function_type == 3))
+                if (nested.isEnd() || nested.isError())
+                {
+                    valid = false;
+                    break;
+                }
+
+                if (nested.type == TokenType::BareWord)
+                    is_function = true;
+
+                if (!nested.isSignificant())
+                    continue;
+
+                if (nested.type == TokenType::OpeningSquareBracket)
+                {
+                    ++array_depth;
+                    ++depth;
+                }
+                else if (nested.type == TokenType::ClosingSquareBracket)
+                    --depth;
+
+                last_significant = nested;
+            }
+            if (use_cast && array_depth == 1  && !is_function && (vector_function_type == 1 || vector_function_type == 3))
             {
                 appendFunctionName(result.new_sql, FunctionNames::CAST);
                 result.new_sql += "('";
@@ -1214,11 +1335,34 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
                 result.normalized_sql += "(";
             }
 
-            if (valid)
+            // Handle the last element after the loop ends
+            if (element_start && array_end > element_start)
+            {
+                // Find the position before the closing bracket
+                const char * last_element_end = array_end;
+                if (last_significant.type == TokenType::ClosingSquareBracket)
+                    last_element_end = last_significant.begin;
+
+                if (last_element_end > element_start)
+                {
+                    String element(element_start, last_element_end - element_start);
+                    // Trim whitespace
+                    size_t start_pos = 0;
+                    size_t end_pos = element.length();
+                    while (start_pos < end_pos && isspace(static_cast<unsigned char>(element[start_pos])))
+                        ++start_pos;
+                    while (end_pos > start_pos && isspace(static_cast<unsigned char>(element[end_pos - 1])))
+                        --end_pos;
+                    if (start_pos < end_pos)
+                        string_array.emplace_back(element.data() + start_pos, end_pos - start_pos);
+                }
+            }
+
+            if (valid && depth == 0)
             {
                 String original_array(array_begin, static_cast<size_t>(array_end - array_begin));
                 result.new_sql += original_array;
-                if (array_depth == 1 && !is_function && (vector_function_type == 1 || vector_function_type == 3))
+                if (array_depth == 1  && !is_function && (vector_function_type == 1 || vector_function_type == 3))
                     result.normalized_sql += "?:array";
                 else
                     result.normalized_sql += original_array;
@@ -1230,38 +1374,21 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
 
                 ++num_literals_in_sequence;
 
-                if (use_cast && array_depth == 1 && !is_function && (vector_function_type == 1 || vector_function_type == 3))
+                if (use_cast && array_depth == 1  && !is_function && (vector_function_type == 1 || vector_function_type == 3))
                 {
-                    result.new_sql += "','Array(Float32)')";
+                    result.new_sql += "','Array(Float)')";
                     result.normalized_sql += ",?:string)";
-                    hash.update(CAST_FUNCTION_NAME.data(), CAST_FUNCTION_NAME.size());
                 }
                 continue;
             }
-        }
-        // add a check for system table queries to prevent caching
-        if (start_system_table_check)
-        {
-            start_system_table_check = false;
-            if (token.type == TokenType::BareWord && token.size() == 6 && tokenMatchesBareWord(token, "system"))
-            {
-                result.hash = 0;
-                result.normalized_sql = "";
-                result.params.clear();
-                LOG_DEBUG(logger, "not support system table, sql({})", std::string(begin, end));
-                return result;
-            }
-        }
-        if (token.type == TokenType::BareWord && token.size() == 4 && tokenMatchesBareWord(token, "from"))
-        {
-            is_from = true;
-            start_system_table_check = true;
         }
         if (token.type == TokenType::Dot)
             is_dot = true;
         else if (!only_vector)
         {
             if (token.type == TokenType::BareWord && token.size() == 5 && tokenMatchesBareWord(token, "limit"))
+                parse_params = false;
+            if (token.type == TokenType::BareWord && token.size() == 8 && tokenMatchesBareWord(token, "settings"))
                 parse_params = false;
             // Detect POSITION function start
             if (token.type == TokenType::BareWord && token.size() == 8 && tokenMatchesBareWord(token, "position"))
@@ -1291,7 +1418,7 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
                     is_negative = true;
             }
             else if (is_negative && token.type != TokenType::Number)
-                is_negative = false;        
+                is_negative = false;
             if (!is_negative && tokenIsValue(token))
                 previous_is_value = true;
             else
@@ -1318,7 +1445,7 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
                     param_type = ParameterInfo::Type::STRING;
                 else
                     param_type = ParameterInfo::Type::STRING;
-                
+
                 String params_value = String(token.begin, token.size());
                 result.new_sql += params_value;
                 if (is_negative && token.type == TokenType::Number)
@@ -1332,7 +1459,7 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
                 {
                     position_param_count++;
                 }
-                
+
                 result.normalized_sql += "?:";
                 if (param_type == ParameterInfo::Type::NUMERIC)
                     result.normalized_sql += "number";
@@ -1375,14 +1502,6 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
         hash.update(token.begin, token.size());
         result.normalized_sql += std::string(token.begin, token.size());
         result.new_sql += std::string(token.begin, token.size());
-    }
-    if (!is_from)
-    {
-        result.hash = 0;
-        result.normalized_sql = "";
-        result.params.clear();
-        LOG_DEBUG(logger, "sql({}) has not from", std::string(begin, end));
-        return result;
     }
     result.hash = hash.get64();
     return result;
@@ -1481,7 +1600,7 @@ bool VectorQueryParameters::replaceConstantsInQueryPlan(
         {
             continue;
         }
-        
+
         if (auto * filter_step = typeid_cast<FilterStep *>(node->step.get()))
         {
             if (plan_constant_binding.dag_scope != "FilterStep")
@@ -1595,7 +1714,7 @@ std::vector<VectorQueryPlanCache::ASTLiteralPosition> VectorQueryParameters::col
             pos.identifier_name = "";
             pos.field_type = static_cast<Int32>(type);
             int literal_number = 0;
-            
+
             size_t parent_size = parent_list.size();
             int parent_index = static_cast<int>(parent_size) - 2;
             if (last_function_name == getFunctionName(FunctionNames::CAST) &&
@@ -1661,7 +1780,7 @@ std::vector<VectorQueryPlanCache::ASTLiteralPosition> VectorQueryParameters::col
                     {
                         is_vector = true;
                         return;
-                    }    
+                    }
                 }
                 else
                 {
@@ -1722,7 +1841,7 @@ std::vector<VectorQueryPlanCache::ASTLiteralPosition> VectorQueryParameters::col
                 unique_strings.insert(ast_path_name);
                 pos.step_type = -1;
                 // Determine step type from ast_path_name in a more robust way
-                if (ast_path_name.length() > static_cast<size_t>(Offset::StepType)) 
+                if (ast_path_name.length() > static_cast<size_t>(Offset::StepType))
                 {
                     char step_char = ast_path_name[static_cast<size_t>(Offset::StepType)];
                     if (step_char == 'E')
@@ -1763,11 +1882,11 @@ std::vector<VectorQueryPlanCache::ASTLiteralPosition> VectorQueryParameters::col
             // The same order must be used everywhere that maps parameter index ->
             // AST literal position -> QueryPlan binding.
             String function_name = Poco::toLower(func->name);
-            
-            if (!only_vector || 
-                    (only_vector && 
+
+            if (!only_vector ||
+                    (only_vector &&
                         (function_name == getFunctionName(FunctionNames::COSINEDISTANCE) || function_name == getFunctionName(FunctionNames::L2DISTANCE) || function_name == getFunctionName(FunctionNames::HASTOKEN) ||
-                            (function_name == getFunctionName(FunctionNames::CAST) && 
+                            (function_name == getFunctionName(FunctionNames::CAST) &&
                                 (last_function_name == getFunctionName(FunctionNames::COSINEDISTANCE) || last_function_name == getFunctionName(FunctionNames::L2DISTANCE) || last_function_name == getFunctionName(FunctionNames::HASTOKEN))
                             )
                         )
@@ -1939,7 +2058,7 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizedAS
             pos.identifier_name = "";
             pos.field_type = static_cast<Int32>(type);
             int literal_number = 0;
-            
+
             size_t parent_size = parent_list.size();
             int parent_index = static_cast<int>(parent_size) - 2;
             if (last_function_name == getFunctionName(FunctionNames::CAST) &&
@@ -2005,7 +2124,7 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizedAS
                     {
                         is_vector = true;
                         return;
-                    }    
+                    }
                 }
                 else
                 {
@@ -2066,7 +2185,7 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizedAS
                 unique_strings.insert(ast_path_name);
                 pos.step_type = -1;
                 // Determine step type from ast_path_name in a more robust way
-                if (ast_path_name.length() > static_cast<size_t>(Offset::StepType)) 
+                if (ast_path_name.length() > static_cast<size_t>(Offset::StepType))
                 {
                     char step_char = ast_path_name[static_cast<size_t>(Offset::StepType)];
                     if (step_char == 'E')
@@ -2109,11 +2228,11 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizedAS
             // The same order must be used everywhere that maps parameter index ->
             // AST literal position -> QueryPlan binding.
             String function_name = Poco::toLower(func->name);
-            
-            if (!only_vector || 
-                    (only_vector && 
+
+            if (!only_vector ||
+                    (only_vector &&
                         (function_name == getFunctionName(FunctionNames::COSINEDISTANCE) || function_name == getFunctionName(FunctionNames::L2DISTANCE) || function_name == getFunctionName(FunctionNames::HASTOKEN) ||
-                            (function_name == getFunctionName(FunctionNames::CAST) && 
+                            (function_name == getFunctionName(FunctionNames::CAST) &&
                                 (last_function_name == getFunctionName(FunctionNames::COSINEDISTANCE) || last_function_name == getFunctionName(FunctionNames::L2DISTANCE) || last_function_name == getFunctionName(FunctionNames::HASTOKEN))
                             )
                         )
@@ -2522,7 +2641,7 @@ std::vector<VectorQueryPlanCache::PlanConstantBinding> VectorQueryParameters::Co
 
     std::vector<bool> candidate_used(candidates.size(), false);
     bindings.reserve(parameters.ast_literal_position_list.size());
-    
+
     for (size_t ast_index = 0; ast_index < parameters.ast_literal_position_list.size(); ++ast_index)
     {
         const auto & ast_position = parameters.ast_literal_position_list[ast_index];
@@ -2585,7 +2704,7 @@ std::vector<VectorQueryPlanCache::PlanConstantBinding> VectorQueryParameters::Co
             bindings.clear();
             return bindings;
         }
-        
+
         const size_t matched_candidate_index = matched_candidate_indexes.front();
         candidate_used[matched_candidate_index] = true;
         auto binding = candidates[matched_candidate_index].binding;
@@ -2607,7 +2726,7 @@ std::vector<VectorQueryPlanCache::PlanConstantBinding> VectorQueryParameters::Co
         bindings.clear();
         return bindings;
     }
-    
+
     std::reverse(bindings.begin(), bindings.end());
     return bindings;
 }
