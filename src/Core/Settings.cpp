@@ -5902,6 +5902,7 @@ Possible values:
     DECLARE(Bool, vector_use_cast, false, R"("Enable CAST in query.)", 0) \
     DECLARE(Bool, vector_query_plan_cache_only_vector, false, R"("VectorQueryPlanCache parse only vector.)", 0) \
     DECLARE(Bool, vector_only_cache_query_plan, false, R"("Enable only cache query plan.)", 0) \
+    DECLARE(Bool, enable_vector_performance_test, false, R"("Enable Vector performance test.)", 0) \
     DECLARE(Seconds, vector_query_plan_cache_ttl, 60, R"("After this time in seconds entries in the vector query plan cache become stale)", 0) \
     DECLARE(String, vector_query_plan_cache_tag, "", R"("A string which acts as a label for vector query plan cache entries.)", 0) \
     DECLARE(Bool, enable_sharing_sets_for_mutations, true, R"(

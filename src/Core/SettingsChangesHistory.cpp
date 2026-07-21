@@ -57,6 +57,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"vector_query_plan_cache", false, false, "New setting to enable/disable vector Query plan cache."},
             {"vector_use_cast", false, false, "New setting to enable/disable CAST with no cached vector query plans."},
             {"vector_only_cache_query_plan", false, false, "New setting to enable/disable only cache query plan."},
+            {"enable_vector_performance_test", false, false, "New setting to enable/disable vector performance test."},
             {"vector_query_plan_cache_only_vector", false, false, "New setting to parse only vector VectorQueryPlan."},
             {"vector_query_plan_cache_max_size_in_bytes", 0, DEFAULT_VECTOR_QUERY_PLAN_CACHE_MAX_SIZE, "Introduced vector query plan cache. The maximum amount of memory (in bytes) the current user may allocate in the vector query plan cache. 0 means unlimited."},
             {"vector_query_plan_cache_max_entries", 0, DEFAULT_VECTOR_QUERY_PLAN_CACHE_MAX_ENTRIES, "Introduced vector query plan cache. The maximum number of query results the current user may store in the vector query plan cache. 0 means unlimited."},

@@ -219,6 +219,7 @@ namespace Setting
     extern const SettingsBool vector_query_plan_cache_only_vector;
     extern const SettingsBool vector_use_cast;
     extern const SettingsBool vector_only_cache_query_plan;
+    extern const SettingsBool enable_vector_performance_test;
     extern const SettingsSeconds vector_query_plan_cache_ttl;
     extern const SettingsUInt64 vector_query_plan_cache_max_size_in_bytes;
     extern const SettingsUInt64 vector_query_plan_cache_max_entries;
@@ -346,7 +347,7 @@ struct VectorQueryPlanCacheRestoreResult
 static VectorQueryPlanCacheRestoreResult tryRestoreFromQueryPlanCache(
     const char * begin,
     const char * end,
-    const ContextPtr & context,
+    ContextMutablePtr context,
     const Settings & settings,
     bool internal,
     const QueryResultCachePtr & query_result_cache,
@@ -364,16 +365,18 @@ static VectorQueryPlanCacheRestoreResult tryRestoreFromQueryPlanCache(
     {
         try
         {
+            const bool enable_vector_performance_test = settings[Setting::enable_vector_performance_test];
             const bool vector_query_plan_cache_only_vector = settings[Setting::vector_query_plan_cache_only_vector];
             VectorQueryParameters::NormalizedQueryResult parameterized_result;
             parameterized_result = parameterizer.normalizeQueryAndExtractParams(begin,
-                end, vector_query_plan_cache_only_vector, vector_use_cast);
+                end, vector_query_plan_cache_only_vector, vector_use_cast, enable_vector_performance_test);
             if (parameterized_result.hash == 0 || parameterized_result.params.empty())
             {
                 LOG_DEBUG(logger, "sql={} is not support or select", std::string(begin, end));
             }
             else
             {
+                result.is_select = true;
                 result.vector_query_for_plan_cache = parameterized_result.normalized_sql;
                 result.new_query = parameterized_result.new_sql;
                 result.params_size = parameterized_result.params.size();
@@ -404,6 +407,7 @@ static VectorQueryPlanCacheRestoreResult tryRestoreFromQueryPlanCache(
                     if (ast_parameters_restored)
                     {
                         LOG_DEBUG(logger, "Restore AST from vector_query_plan_cache({})", result.new_query);
+                        InterpreterSetQuery::applySettingsFromQuery(result.ast, context);
                         result.query_access_info_cache = reader.getQueryAccessInfo();
                         result.vector_ast_restored = true;
                         result.skip_ast_processing = true;
@@ -1660,6 +1664,7 @@ static std::optional<BlockIO> tryExecuteFromCache(
     output.vector_query_for_plan_cache = std::move(cache_result.vector_query_for_plan_cache);
     output.settings_copy = std::move(cache_result.settings_copy);
     output.query_result_cache_usage = cache_result.query_result_cache_usage;
+    output.is_select = cache_result.is_select;
     output.enable_vector_query_plan_cache = enable_vector_query_plan_cache;
     output.skip_ast_processing = cache_result.skip_ast_processing;
     output.can_use_query_result_cache = cache_result.can_use_query_result_cache;
@@ -1733,7 +1738,10 @@ static BlockIO executeQueryImpl(
     chassert(internal || CurrentThread::get().tryGetQueryContext());
     chassert(internal || CurrentThread::get().tryGetQueryContext()->getCurrentQueryId() == CurrentThread::getQueryId());
     bool is_select = false;
-    if (!internal)
+    const Settings & settings = context->getSettingsRef();
+    auto logger = getLogger("executeQuery");
+    bool enable_vector_performance_test = settings[Setting::enable_vector_performance_test];
+    if (!internal && enable_vector_performance_test)
     {
         VectorQueryParameters parameterizer;
         auto light_parse_result = parameterizer.parseVectorSettingsFromQuery(begin, end);
@@ -1744,16 +1752,13 @@ static BlockIO executeQueryImpl(
             context->checkSettingsConstraints(vector_settings, SettingSource::QUERY);
             context->applySettingsChanges(vector_settings);
         }
-    }
-
-    const Settings & settings = context->getSettingsRef();
-
+    } 
+    
     size_t max_query_size = settings[Setting::max_query_size];
     /// Don't limit the size of internal queries or distributed subquery.
     if (internal || client_info.query_kind == ClientInfo::QueryKind::SECONDARY_QUERY)
         max_query_size = 0;
-
-    auto logger = getLogger("executeQuery");
+    
     bool vector_only_cache_query_plan = settings[Setting::vector_only_cache_query_plan];
     bool enable_vector_query_plan_cache = settings[Setting::vector_query_plan_cache];
     CacheProbeOutput cache_output;
@@ -1765,7 +1770,7 @@ static BlockIO executeQueryImpl(
     QueryResultCacheUsage query_result_cache_usage = QueryResultCacheUsage::None;
     String new_query;
     size_t params_size = cache_output.params_size;
-    if (is_select)
+    if (is_select || !enable_vector_performance_test)
     {
         if (!vector_only_cache_query_plan && enable_vector_query_plan_cache)
         {
@@ -1775,6 +1780,8 @@ static BlockIO executeQueryImpl(
             {
                 return std::move(*cached_result);
             }
+            if (!enable_vector_performance_test)
+                is_select = cache_output.is_select;
             skip_ast_processing = cache_output.skip_ast_processing;
             can_use_query_result_cache = cache_output.can_use_query_result_cache;
             query_result_cache_entry_exists = cache_output.query_result_cache_entry_exists;

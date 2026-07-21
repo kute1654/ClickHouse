@@ -936,14 +936,6 @@ bool tokenMatchesBareWord(Token token, std::string_view bare_word_name)
     return true;
 }
 
-bool isVectorPreparseSettingName(std::string_view name)
-{
-    return name == "vector_query_plan_cache"
-        || name == "vector_only_cache_query_plan"
-        || name == "vector_query_plan_cache_only_vector"
-        || name == "vector_use_cast";
-}
-
 std::optional<Field> tokenToSettingField(Token token)
 {
     if (token.type == TokenType::StringLiteral)
@@ -1041,7 +1033,6 @@ VectorQueryParameters::LightParseResult VectorQueryParameters::parseVectorSettin
     bool is_settings = false;
     std::string_view setting_name;
     bool setting_has_name = false;
-    bool setting_is_vector = false;
     bool setting_expect_value = false;
 
     while (true)
@@ -1078,12 +1069,11 @@ VectorQueryParameters::LightParseResult VectorQueryParameters::parseVectorSettin
         {
             if (!setting_expect_value && token.type == TokenType::BareWord && token.size() == 6 && tokenMatchesBareWord(token, "format"))
             {
-                if (setting_has_name && setting_is_vector && !setting_expect_value)
+                if (setting_has_name && !setting_expect_value)
                     result.changes.setSetting(setting_name, Settings::castValueUtil(setting_name, Field(true)));
 
                 setting_name = {};
                 setting_has_name = false;
-                setting_is_vector = false;
                 setting_expect_value = false;
                 is_settings = false;
                 continue;
@@ -1091,12 +1081,11 @@ VectorQueryParameters::LightParseResult VectorQueryParameters::parseVectorSettin
 
             if (token.type == TokenType::Comma)
             {
-                if (setting_has_name && setting_is_vector && !setting_expect_value)
+                if (setting_has_name && !setting_expect_value)
                     result.changes.setSetting(setting_name, Settings::castValueUtil(setting_name, Field(true)));
 
                 setting_name = {};
                 setting_has_name = false;
-                setting_is_vector = false;
                 setting_expect_value = false;
                 continue;
             }
@@ -1107,7 +1096,6 @@ VectorQueryParameters::LightParseResult VectorQueryParameters::parseVectorSettin
                 {
                     setting_name = std::string_view(token.begin, token.size());
                     setting_has_name = true;
-                    setting_is_vector = isVectorPreparseSettingName(setting_name);
                     setting_expect_value = false;
                 }
                 continue;
@@ -1121,27 +1109,22 @@ VectorQueryParameters::LightParseResult VectorQueryParameters::parseVectorSettin
 
             if (setting_expect_value)
             {
-                if (setting_is_vector)
+                if (token.type == TokenType::BareWord && token.size() == 7 && tokenMatchesBareWord(token, "default"))
                 {
-                    if (token.type == TokenType::BareWord && token.size() == 7 && tokenMatchesBareWord(token, "default"))
-                    {
-                        Settings default_settings;
-                        result.changes.setSetting(setting_name, default_settings.get(setting_name));
-                    }
-                    else if (auto value = tokenToSettingField(token))
-                        result.changes.setSetting(setting_name, Settings::castValueUtil(setting_name, *value));
+                    Settings default_settings;
+                    result.changes.setSetting(setting_name, default_settings.get(setting_name));
                 }
+                else if (auto value = tokenToSettingField(token))
+                    result.changes.setSetting(setting_name, Settings::castValueUtil(setting_name, *value));
 
                 setting_name = {};
                 setting_has_name = false;
-                setting_is_vector = false;
                 setting_expect_value = false;
                 continue;
             }
 
             setting_name = {};
             setting_has_name = false;
-            setting_is_vector = false;
             setting_expect_value = false;
             continue;
         }
@@ -1149,7 +1132,7 @@ VectorQueryParameters::LightParseResult VectorQueryParameters::parseVectorSettin
             is_settings = true;
     }
 
-    if (is_settings && setting_has_name && setting_is_vector && !setting_expect_value)
+    if (is_settings && setting_has_name && !setting_expect_value)
         result.changes.setSetting(setting_name, Settings::castValueUtil(setting_name, Field(true)));
 
     return result;
@@ -1176,11 +1159,22 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
     const char * begin,
     const char * end,
     bool only_vector,
-    bool use_cast)
+    bool use_cast,
+    bool enable_vector_performance_test)
 {
     NormalizedQueryResult result;
     SipHash hash;
     Lexer lexer(begin, end);
+    if (!enable_vector_performance_test)
+    {
+        if (!isSelectStatement(lexer))
+        {
+            result.hash = 0;
+            result.normalized_sql = "";
+            LOG_DEBUG(logger, "sql({}) has not begin with select", std::string(begin, end));
+            return result;
+        }
+    }
 
     size_t num_literals_in_sequence = 0;
     bool parse_params = true;
@@ -1199,6 +1193,8 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
     bool is_bare_word = false;
     bool is_dot = false;
     bool is_negative = false;
+    bool is_from = false;
+    bool start_system_table_check = false;
     bool previous_is_value = false;
 
     while (true)
@@ -1382,6 +1378,27 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
                 continue;
             }
         }
+        // add a check for system table queries to prevent caching
+        if (!enable_vector_performance_test)
+        {
+            if (start_system_table_check)
+            {
+                start_system_table_check = false;
+                if (token.type == TokenType::BareWord && token.size() == 6 && tokenMatchesBareWord(token, "system"))
+                {
+                    result.hash = 0;
+                    result.normalized_sql = "";
+                    result.params.clear();
+                    LOG_DEBUG(logger, "not support system table, sql({})", std::string(begin, end));
+                    return result;
+                }
+            }
+            if (token.type == TokenType::BareWord && token.size() == 4 && tokenMatchesBareWord(token, "from"))
+            {
+                is_from = true;
+                start_system_table_check = true;
+            }
+        }
         if (token.type == TokenType::Dot)
             is_dot = true;
         else if (!only_vector)
@@ -1502,6 +1519,17 @@ VectorQueryParameters::NormalizedQueryResult VectorQueryParameters::normalizeQue
         hash.update(token.begin, token.size());
         result.normalized_sql += std::string(token.begin, token.size());
         result.new_sql += std::string(token.begin, token.size());
+    }
+    if (!enable_vector_performance_test)
+    {
+        if (!is_from)
+        {
+            result.hash = 0;
+            result.normalized_sql = "";
+            result.params.clear();
+            LOG_DEBUG(logger, "sql({}) has not from", std::string(begin, end));
+            return result;
+        }
     }
     result.hash = hash.get64();
     return result;

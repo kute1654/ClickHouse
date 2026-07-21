@@ -84,7 +84,7 @@ std::vector<std::pair<String, String>> getRelevantSettings(const Settings & sett
     {
         const String & name = setting.name;
         const String & value = applyVisitor(FieldVisitorToString(), setting.value);
-        if (!isVectorQueryPlanCacheRelatedSetting(name) && name != "allow_experimental_analyzer") /// this setting doesn't affect plan cache key
+        if (!isVectorQueryPlanCacheRelatedSetting(name) && name != "allow_experimental_analyzer" && name != "use_query_cache") /// this setting doesn't affect plan cache key
             changed_settings_sorted.push_back({name, value});
     }
     std::sort(changed_settings_sorted.begin(), changed_settings_sorted.end(), [](auto & lhs, auto & rhs) { return lhs.first < rhs.first; });

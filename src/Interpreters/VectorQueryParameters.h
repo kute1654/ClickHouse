@@ -194,7 +194,8 @@ public:
         const char * begin,
         const char * end,
         bool only_vector = false,
-        bool is_cast = false);
+        bool is_cast = false,
+        bool enable_vector_performance_test = false);
 
     /// Light-weight lexer-only scan for vector settings in top-level query SETTINGS clauses.
     /// This is used before the full SQL parse so vector cache/cast gates can see per-query overrides.
