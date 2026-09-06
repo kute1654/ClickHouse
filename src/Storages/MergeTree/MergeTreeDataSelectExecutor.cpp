@@ -1150,7 +1150,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                     if (!index_and_condition.index->isVectorSimilarityIndex() || !can_use_index(index_and_condition.index))
                         continue;
 
-                    auto condition = index_and_condition.condition_template->generateForPartition(ranges.data_part->partition);
+                    auto condition = index_and_condition.condition_template->generateForPart(ranges.data_part);
                     if (condition && condition->supportsInTraversalVectorFilter())
                     {
                         has_in_traversal_vector_consumer = true;
@@ -2590,7 +2590,7 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
     if (!index_helper->getDeserializedFormat(*part_info, index_helper->getFileName()))
     {
         LOG_DEBUG(log, "File for index {} does not exist ({}.*). Skipping it.", backQuote(index_helper->index.name),
-            (fs::path(part->getDataPartStorage().getFullPath()) / index_helper->getFileName()).string());
+            (fs::path(part_info->getDataPartStorage()->getFullPath()) / index_helper->getFileName()).string());
         return {ranges, std::move(in_read_hints)};
     }
 
@@ -2830,7 +2830,7 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
 
             const size_t vector_begin_mark = index_mark * skip_index_granularity;
             const size_t vector_end_mark = std::min((index_mark + 1) * skip_index_granularity, marks_count);
-            const UInt64 vector_begin_row = part->index_granularity->getMarkStartingRow(vector_begin_mark);
+            const UInt64 vector_begin_row = part_info->getIndexGranularity().getMarkStartingRow(vector_begin_mark);
 
             for (const auto & source_range : ranges)
             {
@@ -2839,8 +2839,8 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
                 if (begin_mark >= end_mark)
                     continue;
 
-                const UInt64 begin_row = part->index_granularity->getMarkStartingRow(begin_mark) - vector_begin_row;
-                const UInt64 end_row = part->index_granularity->getMarkStartingRow(end_mark) - vector_begin_row;
+                const UInt64 begin_row = part_info->getIndexGranularity().getMarkStartingRow(begin_mark) - vector_begin_row;
+                const UInt64 end_row = part_info->getIndexGranularity().getMarkStartingRow(end_mark) - vector_begin_row;
                 if (begin_row < end_row)
                 {
                     /// The source ranges arrive in mark order. Merge adjacent or overlapping ranges
@@ -2869,8 +2869,8 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
             const size_t vector_begin_mark = index_mark * skip_index_granularity;
             const size_t vector_end_mark = std::min((index_mark + 1) * skip_index_granularity, marks_count);
             /// These absolute part row offsets define the vector granule's row domain.
-            const UInt64 vector_begin_row = part->index_granularity->getMarkStartingRow(vector_begin_mark);
-            const UInt64 vector_end_row = part->index_granularity->getMarkStartingRow(vector_end_mark);
+            const UInt64 vector_begin_row = part_info->getIndexGranularity().getMarkStartingRow(vector_begin_mark);
+            const UInt64 vector_end_row = part_info->getIndexGranularity().getMarkStartingRow(vector_end_mark);
             /// USearch keys inside this granule are zero-based offsets in [0, vector_rows).
             const UInt64 vector_rows = vector_end_row - vector_begin_row;
 
@@ -2896,9 +2896,9 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
 
                 /// Convert the overlapping mark interval into absolute part row offsets first, then
                 /// derive source-local and vector-local coordinates from the same part row id.
-                const UInt64 source_begin_row = part->index_granularity->getMarkStartingRow(source_filter.begin_mark);
-                const UInt64 begin_row = part->index_granularity->getMarkStartingRow(begin_mark);
-                const UInt64 end_row = part->index_granularity->getMarkStartingRow(end_mark);
+                const UInt64 source_begin_row = part_info->getIndexGranularity().getMarkStartingRow(source_filter.begin_mark);
+                const UInt64 begin_row = part_info->getIndexGranularity().getMarkStartingRow(begin_mark);
+                const UInt64 end_row = part_info->getIndexGranularity().getMarkStartingRow(end_mark);
 
                 for (UInt64 part_row = begin_row; part_row < end_row; ++part_row)
                 {
@@ -3031,34 +3031,22 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
                     {
                         read_hints = {};
                     }
-                    else
-                    {
-                        const auto & distances = vector_search_results.distances.value();
-                        if (vector_search_results.rows.size() != distances.size())
-                            throw Exception(
-                                ErrorCodes::LOGICAL_ERROR,
-                                "Vector search read hints size mismatch: {} row offsets and {} distances",
-                                vector_search_results.rows.size(),
-                                distances.size());
-
-                        auto & accumulated_results = read_hints.vector_search_results;
-                        if (!accumulated_results.has_value())
-                            accumulated_results.emplace();
-                        if (!accumulated_results->distances.has_value())
-                            accumulated_results->distances.emplace();
-
-                        const size_t first_row_in_index_granule = index_granularity.getMarkStartingRow(index_mark * skip_index_granularity);
-                        for (size_t result_pos = 0; result_pos < vector_search_results.rows.size(); ++result_pos)
-                        {
-                            accumulated_results->rows.push_back(first_row_in_index_granule + vector_search_results.rows[result_pos]);
-                            accumulated_results->distances->push_back(distances[result_pos]);
-                        }
-                    }
+                    /// The vector index returns local row offsets. Store part-local offsets in read
+                    /// hints because the later reader matches them against `_part_offset`.
+                    const size_t vector_begin_mark = index_mark * skip_index_granularity;
+                    const UInt64 vector_begin_row = part_info->getIndexGranularity().getMarkStartingRow(vector_begin_mark);
+                    append_vector_search_read_hints(std::move(local_vector_search_results), vector_begin_row);
 
                     for (auto row : rows)
                     {
-                        size_t num_marks = index_granularity.countMarksForRows(index_mark * skip_index_granularity, row);
-
+                        /// Convert each vector-local row back to a MergeTree mark so the final mark
+                        /// ranges read only marks containing ANN hits that survived scalar pruning.
+                        size_t num_marks = part_info->getIndexGranularity().countMarksForRows(vector_begin_mark, row);
+                        size_t mark = vector_begin_mark + num_marks;
+                        /// This guard prevents a vector result outside current scalar-pruned ranges
+                        /// from reopening marks that earlier index analysis already rejected.
+                        if (mark >= marks_count || !mark_is_allowed_by_current_ranges(mark))
+                            continue;
                         /// Read only the single mark containing this ANN hit. Multiple hits in the
                         /// same mark are coalesced below to avoid duplicate read ranges.
                         MarkRange data_range(

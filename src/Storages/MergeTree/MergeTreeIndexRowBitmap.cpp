@@ -84,11 +84,12 @@ void MergeTreeIndexGranuleRowBitmap::deserializeBinary(ReadBuffer & istr, MergeT
     for (size_t i = 0; i < block.columns(); ++i)
     {
         auto & elem = block.getByPosition(i);
-        elem.column = elem.column->cloneEmpty();
+        auto mutable_col = elem.column->cloneEmpty();
 
         ISerialization::DeserializeBinaryBulkStatePtr state;
         serializations[i]->deserializeBinaryBulkStatePrefix(settings, state, nullptr);
-        serializations[i]->deserializeBinaryBulkWithMultipleStreams(elem.column, 0, rows_to_read, settings, state, nullptr);
+        serializations[i]->deserializeBinaryBulkWithMultipleStreams(*mutable_col, rows_to_read, settings, state, nullptr);
+        elem.column = std::move(mutable_col);
     }
 }
 
